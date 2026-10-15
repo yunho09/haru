@@ -32,6 +32,10 @@ REMINDERS = [
     ("1일 전", 24 * 60 * 60),
 ]
 DEFAULT_REMINDER = 3  # 10분 전
+REPEATS = ["반복 안 함", "매일", "평일 (월~금)", "매주", "2주마다", "매월", "매년"]
+CUSTOM_REPEAT = "사용자 지정 (그대로 유지)"
+WEEKDAY_CODES = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"]
+KEEP = object()  # 반복 규칙을 건드리지 않음
 
 
 def local_tz_name():
@@ -460,6 +464,76 @@ class TimeEntry(Gtk.Box):
         return time(int(self.h.get_value()), int(self.m.get_value()))
 
 
+def parse_rule(text):
+    """'FREQ=WEEKLY;BYDAY=MO' → {'FREQ': 'WEEKLY', 'BYDAY': 'MO'}"""
+    out = {}
+    for part in (text or "").split(";"):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            out[k.upper()] = v
+    return out
+
+
+def repeat_index(r):
+    """반복 규칙 → REPEATS 인덱스. 앱에서 표현 못 하는 규칙이면 None(사용자 지정)."""
+    if not r:
+        return 0
+    if set(r) - {"FREQ", "INTERVAL", "BYDAY", "UNTIL", "BYMONTHDAY", "BYMONTH", "WKST"}:
+        return None  # COUNT, BYSETPOS 등
+    freq, interval, byday = r.get("FREQ"), int(r.get("INTERVAL", "1")), r.get("BYDAY")
+    days = byday.split(",") if byday else []
+    if any(not d.isalpha() for d in days):
+        return None  # 매월 둘째 화요일(2TU) 같은 것
+    if freq == "DAILY" and interval == 1 and not days:
+        return 1
+    if freq == "WEEKLY" and interval == 1 and sorted(days) == sorted(WEEKDAY_CODES[:5]):
+        return 2
+    if freq == "WEEKLY" and interval in (1, 2) and len(days) <= 1:
+        return 3 if interval == 1 else 4
+    if freq == "MONTHLY" and interval == 1 and not days:
+        return 5
+    if freq == "YEARLY" and interval == 1 and not days:
+        return 6
+    return None
+
+
+def rule_until(r):
+    u = r.get("UNTIL")
+    if not u:
+        return None
+    if "T" not in u:
+        return date(int(u[:4]), int(u[4:6]), int(u[6:8]))
+    dt = datetime.strptime(u.rstrip("Z"), "%Y%m%dT%H%M%S")
+    if u.endswith("Z"):
+        dt = dt.replace(tzinfo=timezone.utc).astimezone().replace(tzinfo=None)
+    return dt.date()
+
+
+def build_rule(idx, start, until):
+    """REPEATS 인덱스 → RRULE 문자열 ("" 이면 반복 없음)."""
+    if idx == 0:
+        return ""
+    d = as_date(start)
+    code = WEEKDAY_CODES[d.weekday()]
+    rule = [
+        None,
+        "FREQ=DAILY",
+        "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR",
+        f"FREQ=WEEKLY;BYDAY={code}",
+        f"FREQ=WEEKLY;INTERVAL=2;BYDAY={code}",
+        f"FREQ=MONTHLY;BYMONTHDAY={d.day}",
+        f"FREQ=YEARLY;BYMONTH={d.month};BYMONTHDAY={d.day}",
+    ][idx]
+    if until:
+        if isinstance(start, datetime):
+            # 시각이 있는 일정의 UNTIL 은 UTC 로 (RFC 5545)
+            u = datetime.combine(until, time(23, 59, 59)).astimezone(timezone.utc)
+            rule += f";UNTIL={u:%Y%m%dT%H%M%SZ}"
+        else:
+            rule += f";UNTIL={until:%Y%m%d}"
+    return rule
+
+
 def combo_row(title, labels, selected=0):
     row = Adw.ComboRow(title=title, model=Gtk.StringList.new(labels))
     row.set_selected(selected)
@@ -537,9 +611,29 @@ class EventDialog(Adw.Dialog):
         r_end.add_suffix(self.end_date)
         r_end.add_suffix(self.end_time)
         self.all_day.connect("notify::active", lambda *_: self._all_day_toggled())
-        for w in (self.all_day, r_start, r_end):
+
+        # 반복: 반복 일정이면 원본(첫 회차)의 규칙을 읽는다
+        rule = {}
+        if event is not None and event.recurring:
+            master = self.store.master(event.source_uid, event.uid)
+            rrules = master.get_rrules() if master else None
+            rule = parse_rule(rrules[0].to_string()) if rrules else {"X-UNKNOWN": "1"}
+        idx = repeat_index(rule)
+        labels = REPEATS + ([CUSTOM_REPEAT] if idx is None else [])
+        self._custom_repeat = len(REPEATS) if idx is None else -1
+        self._repeat0 = len(REPEATS) if idx is None else idx
+        self._until0 = rule_until(rule) if idx else None
+        self.repeat = combo_row("반복", labels, self._repeat0)
+        self.repeat_end = Adw.SwitchRow(title="반복 종료일", active=self._until0 is not None)
+        self.until = DateButton(self._until0 or (sd + timedelta(days=30)))
+        self.until.set_visible(self._until0 is not None)
+        self.repeat_end.add_suffix(self.until)
+        self.repeat_end.connect("notify::active", lambda *_: self.until.set_visible(self.repeat_end.get_active()))
+        self.repeat.connect("notify::selected", lambda *_: self._sync_repeat())
+        for w in (self.all_day, r_start, r_end, self.repeat, self.repeat_end):
             g2.add(w)
         page.add(g2)
+        self._sync_repeat()
 
         g3 = Adw.PreferencesGroup()
         if readonly:
@@ -583,6 +677,19 @@ class EventDialog(Adw.Dialog):
         self.set_child(tv)
         self._sync_time_visibility()
         self.set_focus(self.title)
+
+    def _sync_repeat(self):
+        i = self.repeat.get_selected()
+        self.repeat_end.set_visible(i not in (0, self._custom_repeat))
+
+    def _repeat_choice(self):
+        """(인덱스, 종료일) — 사용자 지정이면 인덱스 None."""
+        i = self.repeat.get_selected()
+        if i == self._custom_repeat:
+            return None, self._until0
+        if i == 0:
+            return 0, None
+        return i, self.until.value if self.repeat_end.get_active() else None
 
     def _sync_time_visibility(self):
         on = self.all_day.get_active()
@@ -632,7 +739,16 @@ class EventDialog(Adw.Dialog):
         reminder = self.reminder.get_selected()
         location = self.location.get_text().strip() or None
 
-        def fill(comp, cs, ce):
+        r_idx, r_until = self._repeat_choice()
+        rule_changed = (self._custom_repeat if r_idx is None else r_idx, r_until) != (self._repeat0, self._until0)
+
+        def fill(comp, cs, ce, rule=KEEP):
+            if rule is not KEEP:
+                comp.set_rrules([ICalGLib.Recurrence.new_from_string(rule)] if rule else None)
+                if not rule:
+                    comp.set_rdates(None)
+                    comp.set_exrules(None)
+                    comp.set_exdates(None)
             comp.set_summary(ECal.ComponentText.new(summary, None))
             comp.set_location(location)
             comp.set_descriptions([ECal.ComponentText.new(memo, None)] if memo else [])
@@ -657,12 +773,13 @@ class EventDialog(Adw.Dialog):
             comp = ECal.Component.new()
             comp.set_new_vtype(ECal.ComponentVType.EVENT)
             comp.set_uid(str(uuid.uuid4()))
-            self.store.create(src, fill(comp, s, e), done)
+            self.store.create(src, fill(comp, s, e, build_rule(r_idx, s, r_until) if r_idx else KEEP), done)
             return
 
         ev = self.event
         if not ev.recurring:
-            comp = fill(ECal.Component.new_from_icalcomponent(ev.icomp.clone()), s, e)
+            rule = build_rule(r_idx, s, r_until) if r_idx else KEEP
+            comp = fill(ECal.Component.new_from_icalcomponent(ev.icomp.clone()), s, e, rule)
             if src != ev.source_uid:
                 self.store.move(ev.source_uid, src, comp, done)
             else:
@@ -690,6 +807,13 @@ class EventDialog(Adw.Dialog):
                 done("원본 일정을 찾을 수 없어요")
                 return
             shift = as_date(s) - as_date(ev.start)
+            if rule_changed:
+                # 규칙을 새로 만들면 요일·날짜도 새 시작일 기준으로 다시 정해지니 날짜 이동도 가능
+                m_day = as_date(ical_to_py(master.get_dtstart().get_value())) + shift
+                ms = m_day if not isinstance(s, datetime) else datetime.combine(m_day, s.time())
+                rule = build_rule(r_idx, ms, r_until)
+                self.store.modify(src, fill(master, ms, ms + (e - s), rule), mod, done)
+                return
             if shift.days != 0:
                 # 반복 규칙(예: 매주 월요일)은 그대로라 날짜만 옮기면 일정이 깨진다
                 done("모든 반복의 날짜는 바꿀 수 없어요. 시간·제목 등만 바꾸거나 '이 일정만'을 고르세요")
@@ -699,6 +823,10 @@ class EventDialog(Adw.Dialog):
             ms = m_day if not isinstance(s, datetime) else datetime.combine(m_day, s.time())
             self.store.modify(src, fill(master, ms, ms + (e - s)), mod, done)
 
+        if rule_changed:
+            # 반복 방식 자체를 바꾸는 건 전체에만 의미가 있다
+            run(ECal.ObjModType.ALL)
+            return
         self._ask_scope("이 반복 일정을 어떻게 바꿀까요?", "바꾸기", run,
                         lambda: self.save_btn.set_sensitive(True))
 
