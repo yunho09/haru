@@ -1,7 +1,7 @@
 """하루 → 노션 일기.
 
 선택한 날의 할 일 · 일정 · git 커밋 · 메모를 모아 노션 일기 데이터베이스에
-"2026-10-15 (목)" 페이지로 올린다. 같은 날 페이지가 있으면 내용을 새로 덮어쓴다.
+"2026-10-15" 페이지로 올린다. 같은 날 페이지가 있으면 내용을 새로 덮어쓴다.
 
 설정: ~/.config/haru/notion.json
     {"token": "ntn_...", "database_id": "...", "project_root": "/data/project"}
@@ -16,9 +16,8 @@ from pathlib import Path
 
 CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "haru" / "notion.json"
 MEMO_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "haru" / "memo"
-DEFAULT_DATABASE = "3c17a4d6147480a3b1e3e6337529228e"  # 장윤호 > 📕 일기
+DEFAULT_DATABASE = "3977a4d61474805eb40ccea9b6d918ff"  # 🎒 일기 (기존 일기들이 있는 곳)
 TITLE_PROP = "이름"
-WEEKDAYS = ["월", "화", "수", "목", "금", "토", "일"]
 API = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
 
@@ -138,7 +137,8 @@ def bullet(text):
 
 
 def title_for(day):
-    return f"{day.isoformat()} ({WEEKDAYS[day.weekday()]})"
+    # 기존 일기 제목 형식("2026-09-21")에 맞춘다
+    return day.isoformat()
 
 
 # ───────────────────────── 노션 ─────────────────────────
@@ -204,7 +204,6 @@ def push(cfg, day, blocks):
         return page.get("url", "")
     page = _call(token, "POST", "/pages", {
         "parent": {"database_id": db},
-        "icon": {"type": "emoji", "emoji": "📕"},
         "properties": {TITLE_PROP: {"title": [{"type": "text", "text": {"content": title}}]}},
         "children": blocks[:100],
     })
