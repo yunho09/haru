@@ -7,7 +7,7 @@
 """
 import sys
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
 
 import gi
@@ -683,6 +683,9 @@ class EventDialog(Adw.Dialog):
         tv.add_top_bar(header)
         self.set_child(tv)
         self._sync_time_visibility()
+        if event is None and span is None:
+            # 새 일정은 하루 종일이 기본. 끄면 다음 정각부터 1시간으로 채워져 있다
+            self.all_day.set_active(True)
         self.set_focus(self.title)
 
     def _sync_repeat(self):
@@ -1232,12 +1235,26 @@ class Window(Adw.ApplicationWindow):
             d["active"] = True
             g.set_state(Gtk.EventSequenceState.CLAIMED)
         btn, _ = self._cell_at(d["x"] + dx, d["y"] + dy)
-        if btn is not None:
-            d["target"] = btn.cell["date"]
+        if btn is None or (d.get("shown") == btn.cell["date"]):
+            return
+        d["target"] = d["shown"] = btn.cell["date"]
         a, b = self._drag_range(d)
         for cell in self.cells:
             on = a <= cell.cell["date"] <= b
             (cell.add_css_class if on else cell.remove_css_class)("drag-range")
+        # 놓기 전에도 막대가 늘어난 모습을 보여준다
+        ev = d["event"]
+        if ev is not None:
+            s, e = self._stretched(ev, a, b)
+            self._preview = replace(ev, start=s, end=e)
+            events = [self._preview if x is ev else x for x in self.events]
+        else:
+            cals = self.store.writable(ECal.ClientSourceType.EVENTS)
+            self._preview = Event(uid="", rid="", source_uid=cals[0] if cals else "", summary="새 일정",
+                                  location="", start=a, end=b + timedelta(days=1), all_day=True,
+                                  icomp=None, recurring=False)
+            events = self.events + [self._preview]
+        self._render_grid(events)
 
     def _drag_end(self, _g, _dx, _dy):
         d, self._drag = self._drag, None
@@ -1246,6 +1263,10 @@ class Window(Adw.ApplicationWindow):
         if d is None or not d["active"]:
             return
         a, b = self._drag_range(d)
+        if d["event"] is None or (a, b) == d["event"].days():
+            # 새 일정은 창에서 저장할 때 생기고, 안 바뀐 일정은 원래대로 되돌린다
+            self._preview = None
+            self._render_grid(self.events)
         if d["event"] is not None:
             self.stretch(d["event"], a, b)
         elif not self.store.writable(ECal.ClientSourceType.EVENTS):
@@ -1254,23 +1275,29 @@ class Window(Adw.ApplicationWindow):
             self.selected = a
             EventDialog(self, day=a, span=(a, b)).present(self)
 
+    @staticmethod
+    def _stretched(ev, first, last):
+        """first~last 날짜에 걸치도록 바꾼 (시작, 끝) — 시각은 그대로."""
+        if ev.all_day:
+            return first, last + timedelta(days=1)
+        s = datetime.combine(first, ev.start.time())
+        if ev.end.time() == time(0) and ev.end.date() > ev.start.date():
+            e = datetime.combine(last + timedelta(days=1), time(0))
+        else:
+            e = datetime.combine(last, ev.end.time())
+        if e <= s:
+            e = s + timedelta(hours=1)
+        return s, e
+
     def stretch(self, ev, first, last):
         """일정을 first~last 날짜에 걸치도록 바꾼다 (시각은 그대로)."""
         if (first, last) == ev.days():
             return
         if ev.source_uid not in self.store.writable(ECal.ClientSourceType.EVENTS):
             self.toast("읽기 전용 캘린더라 바꿀 수 없어요")
+            self.refresh()
             return
-        if ev.all_day:
-            s, e = first, last + timedelta(days=1)
-        else:
-            s = datetime.combine(first, ev.start.time())
-            if ev.end.time() == time(0) and ev.end.date() > ev.start.date():
-                e = datetime.combine(last + timedelta(days=1), time(0))
-            else:
-                e = datetime.combine(last, ev.end.time())
-            if e <= s:
-                e = s + timedelta(hours=1)
+        s, e = self._stretched(ev, first, last)
         comp = ECal.Component.new_from_icalcomponent(ev.icomp.clone())
         mod = ECal.ObjModType.ALL
         if ev.recurring:
@@ -1287,6 +1314,7 @@ class Window(Adw.ApplicationWindow):
         def done(err):
             if err:
                 self.toast(f"변경 실패: {err}")
+                self.refresh()
             elif ev.recurring:
                 self.toast("반복 일정은 이 회차만 바꿨어요")
 
@@ -1383,14 +1411,24 @@ class Window(Adw.ApplicationWindow):
         self.events = self.store.events(start, end)
         self.all_tasks = self.store.tasks()
         self.month_label.set_label(f"{first.year}년 {first.month}월")
+        self._grid_start = start
+        self._preview = None
+        self._render_grid(self.events)
+        self._render_selection()
+        self._render_day()
+        self._render_tasks()
+        self._sync_header()
 
+    def _render_grid(self, events):
+        """달력 칸을 그린다. 드래그 중에는 미리보기 일정이 섞인 목록으로 다시 그린다."""
+        start, first = self._grid_start, self.month
         today = date.today()
         lanes = {}  # (일정 id, 주 번호) → 줄 번호
         for w in range(6):
             wf = start + timedelta(days=7 * w)
             wl = wf + timedelta(days=6)
             week = []
-            for e in self.events:
+            for e in events:
                 ef, el = e.days()
                 if ef <= wl and el >= wf:
                     week.append((e, ef, el))
@@ -1415,7 +1453,7 @@ class Window(Adw.ApplicationWindow):
             cell["date"] = d
             num = cell["num"]
             num.set_label(str(d.day))
-            day_events = [e for e in self.events if e.covers(d)]
+            day_events = [e for e in events if e.covers(d)]
             holiday = any(e.day_off for e in day_events)
             for cls, on in (
                 ("today", d == today),
@@ -1454,7 +1492,9 @@ class Window(Adw.ApplicationWindow):
                 if d < el:
                     lab.add_css_class("cont-right")
                 lab.event = e
-                lab.set_cursor_from_name("grab")
+                if e is self._preview:
+                    lab.add_css_class("dragging")
+                lab.set_cursor_from_name("grabbing" if e is self._preview else "grab")
                 lab.set_tooltip_text(f"{e.summary}\n끌어서 기간 늘리기")
                 chips.append(lab)
             if hidden:
@@ -1463,10 +1503,6 @@ class Window(Adw.ApplicationWindow):
                 chips.append(more)
             btn.set_tooltip_text("\n".join(
                 (e.summary if e.all_day else f"{fmt_time(e.start)} {e.summary}") for e in day_events) or None)
-        self._render_selection()
-        self._render_day()
-        self._render_tasks()
-        self._sync_header()
 
     def _render_selection(self):
         for btn in self.cells:
@@ -1535,7 +1571,8 @@ class Window(Adw.ApplicationWindow):
 BASE_CSS = """
 .month-cell { padding: 4px 0; margin: 0; border-radius: 10px; min-height: 64px; }
 .month-cell .day-num { margin-left: 4px; }
-.month-cell.drag-range { background-color: alpha(@accent_bg_color, .22); }
+.month-cell.drag-range { background-color: alpha(@accent_bg_color, .10); }
+.month-cell .chip.dragging { box-shadow: inset 0 1px alpha(@accent_bg_color, .9), inset 0 -1px alpha(@accent_bg_color, .9); font-weight: 700; }
 .month-cell.other-month { opacity: .45; }
 .month-cell.selected-day { background-color: alpha(@accent_bg_color, .14); box-shadow: inset 0 0 0 2px alpha(@accent_bg_color, .55); }
 .day-num { font-weight: 700; font-feature-settings: "tnum"; min-width: 24px; min-height: 24px; border-radius: 12px; padding: 0 2px; }
