@@ -1210,49 +1210,21 @@ class WeekView(Gtk.Box):
                          color=rgba(fg.to_string(), 0.7))
                 self._rects.append((x, y, w, h, e))
 
-        # 끄는 중인 일정: 맨 위에 진한 색 + 흰 글씨로 바뀐 시각
+        # 끄는 중인 블록: 마우스를 그대로 따라오고(시각 글자만 15분 단위), 놓으면 제자리로 미끄러진다
         d = self._drag
-        if dragging is not None and d.get("new"):
+        if d and d.get("active") and d.get("new"):
             ns, ne = d["new"]
-            c = rgba(self.win.store.colors.get(dragging.source_uid, "#62a0ea"))
-            white = rgba("white")
-            for i, day in enumerate(days):
-                d0 = datetime.combine(day, time())
-                s0, e0 = max(ns, d0), min(ne, d0 + timedelta(days=1))
-                if e0 <= s0:
-                    continue
-                x = self.GUTTER + i * colw + 2
-                w = colw - 4
-                y = (s0 - d0).total_seconds() / 3600 * self.HOUR + 1
-                h = max((e0 - s0).total_seconds() / 3600 * self.HOUR - 2, 22)
-                cr.save()
-                set_src(cr, rgba("black"), 0.35)  # 그림자
-                round_rect(cr, x + 1, y + 3, w, h, 6)
-                cr.fill()
-                cr.restore()
-                set_src(cr, c, 0.95)
-                round_rect(cr, x, y, w, h, 6)
-                cr.fill()
-                set_src(cr, accent)
-                cr.set_line_width(2)
-                round_rect(cr, x + 1, y + 1, w - 2, h - 2, 5)
-                cr.stroke()
-                used = text(cr, self, f"{ns:%H:%M}–{ne:%H:%M}", x + 8, y + 3, w - 12, size=9.5, bold=True,
-                            color=white)
-                if h - used > 16:
-                    text(cr, self, dragging.summary, x + 8, y + 3 + used, w - 12, size=8.5, color=white)
-
-        # 새 일정 범위
-        if d and d.get("active") and d.get("event") is None and d.get("new"):
-            s, en = d["new"]
-            i = days.index(s.date())
-            y0 = (s - datetime.combine(s.date(), time())).total_seconds() / 3600 * self.HOUR
-            y1 = (en - datetime.combine(s.date(), time())).total_seconds() / 3600 * self.HOUR
-            set_src(cr, accent, 0.35)
-            round_rect(cr, self.GUTTER + i * colw + 2, y0 + 1, colw - 4, max(y1 - y0 - 2, 10), 5)
-            cr.fill()
-            text(cr, self, f"{s:%H:%M}–{en:%H:%M}", self.GUTTER + i * colw + 8, y0 + 3, colw - 12, size=8.5,
-                 bold=True, color=fg)
+            rect = self._live_rect(d, colw)
+            if rect is None:  # 여러 날에 걸친 경우: 맞춰진 자리에 그린다
+                for i, day in enumerate(days):
+                    d0 = datetime.combine(day, time())
+                    s0, e0 = max(ns, d0), min(ne, d0 + timedelta(days=1))
+                    if e0 > s0:
+                        self._draw_block(cr, d, (self.GUTTER + i * colw + 2,
+                                                 (s0 - d0).total_seconds() / 3600 * self.HOUR + 1, colw - 4,
+                                                 max((e0 - s0).total_seconds() / 3600 * self.HOUR - 2, 22)), accent)
+            else:
+                self._draw_block(cr, d, rect, accent)
 
         # 지금 시각
         if today in days:
@@ -1265,6 +1237,64 @@ class WeekView(Gtk.Box):
             cr.fill()
             cr.arc(self.GUTTER + i * colw, y, 4, 0, 6.2832)
             cr.fill()
+
+    def _snapped_rect(self, d, colw):
+        """맞춰진 시각의 블록 위치 (한 날 안일 때만)."""
+        ns, ne = d["new"]
+        days = self.days()
+        if ns.date() not in days or (ne - datetime.combine(ns.date(), time())) > timedelta(days=1):
+            return None
+        i = days.index(ns.date())
+        d0 = datetime.combine(ns.date(), time())
+        y = (ns - d0).total_seconds() / 3600 * self.HOUR + 1
+        h = max((ne - ns).total_seconds() / 3600 * self.HOUR - 2, 22)
+        return self.GUTTER + i * colw + 2, y, colw - 4, h
+
+    def _live_rect(self, d, colw):
+        """마우스를 그대로 따라가는 블록 위치. 놓은 뒤에는 맞춰진 자리로 보간한다."""
+        snapped = self._snapped_rect(d, colw)
+        if snapped is None:
+            return None
+        px, py = d.get("px", (d["x"], d["y"]))
+        sx, sy, sw, sh = snapped
+        if d["mode"] == "move":
+            raw = (min(max(px - d.get("grab_px", sw / 2), self.GUTTER), self.GUTTER + 7 * colw - sw),
+                   py - d.get("grab_py", 10), sw, sh)
+        elif d["mode"] == "resize":
+            raw = (sx, sy, sw, max(py - sy, 22))
+        else:
+            ay = d["y"]
+            raw = (sx, min(ay, py), sw, max(abs(py - ay), 22))
+        t = d.get("settle")
+        if t is None:
+            return raw
+        return tuple(r + (q - r) * t for r, q in zip(raw, snapped))
+
+    def _draw_block(self, cr, d, rect, accent):
+        x, y, w, h = rect
+        ns, ne = d["new"]
+        ev = d["event"]
+        white = rgba("white")
+        if ev is None:  # 새 일정 범위
+            set_src(cr, accent, 0.40)
+            round_rect(cr, x, y, w, h, 6)
+            cr.fill()
+            text(cr, self, f"{ns:%H:%M}–{ne:%H:%M}", x + 8, y + 3, w - 12, size=9, bold=True, color=white)
+            return
+        c = rgba(self.win.store.colors.get(ev.source_uid, "#62a0ea"))
+        set_src(cr, rgba("black"), 0.35)  # 그림자
+        round_rect(cr, x + 1, y + 4, w, h, 6)
+        cr.fill()
+        set_src(cr, c, 0.95)
+        round_rect(cr, x, y, w, h, 6)
+        cr.fill()
+        set_src(cr, accent)
+        cr.set_line_width(2)
+        round_rect(cr, x + 1, y + 1, w - 2, h - 2, 5)
+        cr.stroke()
+        used = text(cr, self, f"{ns:%H:%M}–{ne:%H:%M}", x + 8, y + 3, w - 12, size=9.5, bold=True, color=white)
+        if h - used > 16:
+            text(cr, self, ev.summary, x + 8, y + 3 + used, w - 12, size=8.5, color=white)
 
     @staticmethod
     def _layout(segs):
@@ -1298,13 +1328,18 @@ class WeekView(Gtk.Box):
         self.body.set_cursor_from_name("ns-resize" if edge else "grab" if ev else "default")
 
     def _begin(self, _g, x, y):
+        if self._drag and self._drag.get("settle") is not None:
+            self._settle_anim.skip()  # 이전 드래그가 자리 잡는 중이면 바로 끝낸다
         ev, edge = self._hit(x, y)
         day, minutes = self._at(x, y)
-        self._drag = {"x": x, "y": y, "event": ev, "active": False, "new": None,
+        self._drag = {"x": x, "y": y, "px": (x, y), "event": ev, "active": False, "new": None,
                       "mode": "resize" if edge else "move" if ev else "create",
                       "anchor": self._dt(day, minutes)}
         if ev is not None:
             self._drag["grab"] = self._dt(day, minutes) - ev.start  # 잡은 곳과 시작의 차이
+            for rx, ry, rw, rh, e in self._rects:  # 블록 안에서 잡은 위치(px)
+                if e is ev and rx <= x <= rx + rw and ry <= y <= ry + rh:
+                    self._drag["grab_px"], self._drag["grab_py"] = x - rx, y - ry
 
     def _update(self, g, dx, dy):
         d = self._drag
@@ -1315,6 +1350,7 @@ class WeekView(Gtk.Box):
                 return
             d["active"] = True
             g.set_state(Gtk.EventSequenceState.CLAIMED)
+        d["px"] = (d["x"] + dx, d["y"] + dy)
         day, minutes = self._at(d["x"] + dx, d["y"] + dy)
         at = self._dt(day, minutes)
         ev = d["event"]
@@ -1334,9 +1370,27 @@ class WeekView(Gtk.Box):
         self.body.queue_draw()
 
     def _end(self, _g, dx, dy):
-        d, self._drag = self._drag, None
-        if d is None:
+        d = self._drag
+        if d is None or d.get("settle") is not None:
             return
+        if d["active"] and d["new"] is not None and self._snapped_rect(d, self._colw(self.body.get_width())):
+            # 마우스 자리에서 맞춰진 시각 자리로 미끄러진 뒤 반영
+            d["settle"] = 0.0
+
+            def step(v):
+                d["settle"] = v
+                self.body.queue_draw()
+
+            self._settle_anim = Adw.TimedAnimation.new(self.body, 0, 1, 160, Adw.CallbackAnimationTarget.new(step))
+            self._settle_anim.set_easing(Adw.Easing.EASE_OUT_CUBIC)
+            self._settle_anim.connect("done", lambda *_: self._finish(d))
+            self._settle_anim.play()
+            return
+        self._finish(d)
+
+    def _finish(self, d):
+        if self._drag is d:
+            self._drag = None
         win = self.win
         if not d["active"]:  # 그냥 클릭
             if win.get_visible_dialog() is not None:
@@ -1564,8 +1618,15 @@ class Window(Adw.ApplicationWindow):
                 self.cells.append(btn)
 
         self.week = WeekView(self)
+        # 끄는 동안 마우스를 따라다니는 막대
+        self.float_chip = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END, halign=Gtk.Align.START,
+                                    valign=Gtk.Align.START, can_target=False, visible=False)
+        self.float_chip.add_css_class("chip")
+        self.float_chip.add_css_class("floating")
+        self.month_overlay = Gtk.Overlay(child=grid)
+        self.month_overlay.add_overlay(self.float_chip)
         self.view_stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE, vexpand=True)
-        self.view_stack.add_named(grid, "month")
+        self.view_stack.add_named(self.month_overlay, "month")
         self.view_stack.add_named(self.week, "week")
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         content.append(nav)
@@ -1686,6 +1747,15 @@ class Window(Adw.ApplicationWindow):
         y, m = y + (m - 1) // 12, (m - 1) % 12 + 1
         self.month = date(y, m, 1)
         self.refresh()
+        self._fade_in()
+
+    def _fade_in(self):
+        """달·주가 바뀔 때 달력이 살짝 비쳤다가 또렷해진다."""
+        anim = Adw.TimedAnimation.new(self.view_stack, 0.3, 1, 220,
+                                      Adw.PropertyAnimationTarget.new(self.view_stack, "opacity"))
+        anim.set_easing(Adw.Easing.EASE_OUT_CUBIC)
+        anim.play()
+        self._fade_anim = anim  # 끝날 때까지 참조 유지
 
     def shift_period(self, n):
         if self.view_stack.get_visible_child_name() == "week":
@@ -1703,6 +1773,8 @@ class Window(Adw.ApplicationWindow):
         if (self.selected.year, self.selected.month) != (self.month.year, self.month.month):
             self.select_day(self.selected)
             return
+        if self.view_stack.get_visible_child_name() == "week" and self.week.week_start != getattr(self, "_shown_week", None):
+            self._fade_in()
         self._render_selection()
         self._render_day()
         self._update_title()
@@ -1721,9 +1793,13 @@ class Window(Adw.ApplicationWindow):
         self.select_day(date.today())
 
     def select_day(self, d):
+        before = (self.month, self.week.week_start)
         self.selected = d
         self.month = d.replace(day=1)
         self.refresh()
+        week = self.view_stack.get_visible_child_name() == "week"
+        if (self.week.week_start if week else self.month) != (before[1] if week else before[0]):
+            self._fade_in()
 
     def new_event(self):
         if not self.store.writable(ECal.ClientSourceType.EVENTS):
@@ -1807,11 +1883,14 @@ class Window(Adw.ApplicationWindow):
         self._drag = None
         if btn is not None and btn.cell["date"] is not None:
             mode = None
+            grab = (0, 0)
             if chip is not None:
                 ok, p = self.grid.compute_point(chip, Graphene.Point().init(x, y))
                 mode = (self._chip_edge(chip, p.x) if ok else None) or "move"
+                grab = (p.x, p.y) if ok else (0, 0)
             self._drag = {"x": x, "y": y, "origin": btn.cell["date"], "target": btn.cell["date"],
-                          "event": event, "mode": mode, "active": False}
+                          "event": event, "mode": mode, "active": False, "grab": grab,
+                          "chip_w": btn.get_width() - 8}
 
     def _drag_update(self, g, dx, dy):
         d = self._drag
@@ -1822,6 +1901,21 @@ class Window(Adw.ApplicationWindow):
                 return
             d["active"] = True
             g.set_state(Gtk.EventSequenceState.CLAIMED)
+            if d["mode"] == "move":
+                ev = d["event"]
+                self.float_chip.set_label(ev.summary if ev.all_day else f"{ev.start:%H:%M} {ev.summary}")
+                for cls in list(self.float_chip.get_css_classes()):
+                    if cls.startswith("c") and cls[1:].isdigit():
+                        self.float_chip.remove_css_class(cls)
+                self.float_chip.add_css_class(self._color_class.get(ev.source_uid, "c0"))
+                self.float_chip.set_size_request(max(d["chip_w"], 60), -1)
+                self.float_chip.set_visible(True)
+        if d["mode"] == "move":  # 막대가 칸에 맞춰지기 전에도 마우스를 부드럽게 따라온다
+            ok, p = self.grid.compute_point(self.month_overlay,
+                                            Graphene.Point().init(d["x"] + dx - d["grab"][0], d["y"] + dy - d["grab"][1]))
+            if ok:
+                self.float_chip.set_margin_start(max(int(p.x), 0))
+                self.float_chip.set_margin_top(max(int(p.y), 0))
         btn, _, _ = self._cell_at(d["x"] + dx, d["y"] + dy)
         if btn is None or (d.get("shown") == btn.cell["date"]):
             return
@@ -1846,6 +1940,7 @@ class Window(Adw.ApplicationWindow):
 
     def _drag_end(self, _g, _dx, _dy):
         d, self._drag = self._drag, None
+        self.float_chip.set_visible(False)
         for cell in self.cells:
             cell.remove_css_class("drag-range")
         if d is None or not d["active"]:
@@ -2011,6 +2106,7 @@ class Window(Adw.ApplicationWindow):
             self._color_class[uid] = f"c{i}"
             css.append(f".chip.c{i} {{ background-color: alpha({color}, .22); border-left: 3px solid {color}; }}")
             css.append(f".bar.c{i} {{ background-color: {color}; }}")
+            css.append(f".chip.floating.c{i} {{ background-color: mix(@window_bg_color, {color}, .35); }}")
         self.css.load_from_string(BASE_CSS + "\n".join(css))
 
     def refresh(self):
@@ -2129,6 +2225,7 @@ class Window(Adw.ApplicationWindow):
         for btn in self.cells:
             (btn.add_css_class if btn.cell["date"] == self.selected else btn.remove_css_class)("selected-day")
         self.week.update()
+        self._shown_week = self.week.week_start
 
     def _render_day(self):
         d = self.selected
@@ -2261,10 +2358,12 @@ class Window(Adw.ApplicationWindow):
 
 
 BASE_CSS = """
-.month-cell { padding: 4px 0; margin: 0; border-radius: 10px; min-height: 64px; }
+.month-cell { padding: 4px 0; margin: 0; border-radius: 10px; min-height: 64px;
+              transition: background-color 180ms ease-out, box-shadow 180ms ease-out; }
+.chip.floating { margin: 0; font-weight: 700; box-shadow: 0 8px 18px alpha(black, .45); }
 .month-cell .day-num { margin-left: 4px; }
 .month-cell.drag-range { background-color: alpha(@accent_bg_color, .20); }
-.month-cell .chip.dragging { background-color: @accent_bg_color; color: @accent_fg_color; border-left-color: transparent; font-weight: 700; }
+.month-cell .chip.dragging { font-weight: 700; box-shadow: inset 0 2px alpha(@accent_bg_color, .95), inset 0 -2px alpha(@accent_bg_color, .95); }
 .month-cell.other-month { opacity: .45; }
 .month-cell.selected-day { background-color: alpha(@accent_bg_color, .14); box-shadow: inset 0 0 0 2px alpha(@accent_bg_color, .55); }
 .day-num { font-weight: 700; font-feature-settings: "tnum"; min-width: 24px; min-height: 24px; border-radius: 12px; padding: 0 2px; }
