@@ -19,7 +19,10 @@ gi.require_version("Adw", "1")
 gi.require_version("EDataServer", "1.2")
 gi.require_version("ECal", "2.0")
 gi.require_version("ICalGLib", "3.0")
-from gi.repository import Adw, ECal, EDataServer, Gdk, Gio, GLib, GObject, Gtk, ICalGLib, Pango  # noqa: E402
+gi.require_version("PangoCairo", "1.0")
+gi.require_version("Graphene", "1.0")
+from gi.repository import (Adw, ECal, EDataServer, Gdk, Gio, GLib, GObject, Graphene, Gtk,  # noqa: E402
+                           ICalGLib, Pango, PangoCairo)
 
 import diary  # noqa: E402
 
@@ -576,7 +579,7 @@ def set_reminder(comp, idx):
 
 
 class EventDialog(Adw.Dialog):
-    def __init__(self, win, day=None, event=None, span=None):
+    def __init__(self, win, day=None, event=None, span=None, times=None):
         super().__init__(title="일정 편집" if event else "새 일정", content_width=440)
         self.win, self.store, self.event = win, win.store, event
         cal_uids = self.store.writable(ECal.ClientSourceType.EVENTS)
@@ -595,6 +598,8 @@ class EventDialog(Adw.Dialog):
             start, end, all_day = base, base + timedelta(hours=1), False
             if span:  # 달력에서 여러 날을 끌어 고른 경우: 하루 종일 일정
                 start, end, all_day = span[0], span[1] + timedelta(days=1), True
+            if times:  # 주간 보기에서 시간대를 끌어 고른 경우
+                start, end, all_day = times[0], times[1], False
 
         page = Adw.PreferencesPage()
         g1 = Adw.PreferencesGroup()
@@ -689,7 +694,7 @@ class EventDialog(Adw.Dialog):
         tv.add_top_bar(header)
         self.set_child(tv)
         self._sync_time_visibility()
-        if event is None and span is None:
+        if event is None and span is None and times is None:
             # 새 일정은 하루 종일이 기본. 끄면 다음 정각부터 1시간으로 채워져 있다
             self.all_day.set_active(True)
         self.set_focus(self.title)
@@ -945,6 +950,409 @@ class TaskDialog(Adw.Dialog):
         self.win.store.modify(self.task.source_uid, comp, ECal.ObjModType.ALL, done)
 
 
+# ───────────────────────── 주간 보기 ─────────────────────────
+
+def rgba(hex_or_rgba, alpha=1.0):
+    c = Gdk.RGBA()
+    c.parse(hex_or_rgba)
+    c.alpha = alpha
+    return c
+
+
+def set_src(cr, c, alpha=None):
+    cr.set_source_rgba(c.red, c.green, c.blue, c.alpha if alpha is None else alpha)
+
+
+def round_rect(cr, x, y, w, h, r):
+    r = min(r, w / 2, h / 2)
+    cr.new_sub_path()
+    cr.arc(x + w - r, y + r, r, -1.5708, 0)
+    cr.arc(x + w - r, y + h - r, r, 0, 1.5708)
+    cr.arc(x + r, y + h - r, r, 1.5708, 3.1416)
+    cr.arc(x + r, y + r, r, 3.1416, 4.7124)
+    cr.close_path()
+
+
+def text(cr, widget, s, x, y, width, size=9, bold=False, color=None, lines=1, align=Pango.Alignment.LEFT):
+    layout = widget.create_pango_layout(None)  # 위젯 글꼴·힌팅 설정을 그대로 쓴다
+    fd = widget.get_pango_context().get_font_description().copy()
+    fd.set_size(size * Pango.SCALE)
+    if bold:
+        fd.set_weight(Pango.Weight.BOLD)
+    layout.set_font_description(fd)
+    layout.set_width(max(int(width * Pango.SCALE), 1))
+    layout.set_ellipsize(Pango.EllipsizeMode.END)
+    layout.set_height(-lines)
+    layout.set_alignment(align)
+    layout.set_text(s, -1)
+    if color is not None:
+        set_src(cr, color)
+    cr.move_to(x, y)
+    PangoCairo.show_layout(cr, layout)
+    return layout.get_pixel_size()[1]
+
+
+class WeekView(Gtk.Box):
+    """일요일부터 7일, 시간표 형태. 일정을 끌어 시간·요일 옮기기, 아래 끝을 끌어 길이 바꾸기,
+    빈 칸을 끌어 새 일정."""
+
+    HOUR = 48     # 한 시간 높이(px)
+    GUTTER = 56   # 왼쪽 시각 칸
+    SNAP = 15     # 분 단위 맞춤
+    LANE = 22     # 하루 종일 줄 높이
+    HEAD = 46     # 요일·날짜 줄 높이
+
+    def __init__(self, win):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, hexpand=True, vexpand=True)
+        self.win = win
+        self.head = Gtk.DrawingArea(content_height=self.HEAD)
+        self.head.set_draw_func(self._draw_head)
+        self.body = Gtk.DrawingArea(content_height=24 * self.HOUR)
+        self.body.set_draw_func(self._draw_body)
+        self.scroller = Gtk.ScrolledWindow(child=self.body, vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
+        self.append(self.head)
+        self.append(Gtk.Separator())
+        self.append(self.scroller)
+        self._rects = []       # 본문에 그린 일정 (x, y, w, h, 일정)
+        self._head_rects = []  # 하루 종일 막대
+        self._drag = None
+        self._scrolled = False
+
+        drag = Gtk.GestureDrag()
+        drag.connect("drag-begin", self._begin)
+        drag.connect("drag-update", self._update)
+        drag.connect("drag-end", self._end)
+        self.body.add_controller(drag)
+        dbl = Gtk.GestureClick()
+        dbl.connect("pressed", self._body_pressed)
+        self.body.add_controller(dbl)
+        motion = Gtk.EventControllerMotion()
+        motion.connect("motion", self._motion)
+        self.body.add_controller(motion)
+        head_click = Gtk.GestureClick()
+        head_click.connect("released", self._head_released)
+        self.head.add_controller(head_click)
+        self.connect("map", lambda *_: GLib.idle_add(self._scroll_to_morning))
+
+    # ── 데이터 ──
+    @property
+    def week_start(self):
+        d = self.win.selected
+        return d - timedelta(days=(d.weekday() + 1) % 7)
+
+    def days(self):
+        ws = self.week_start
+        return [ws + timedelta(days=i) for i in range(7)]
+
+    def events(self):
+        """미리보기(끄는 중인 일정)를 반영한 이번 주 일정."""
+        evs = getattr(self.win, "events", [])
+        d = self._drag
+        if d and d.get("active") and d.get("event") is not None and d.get("new"):
+            ev = d["event"]
+            evs = [replace(x, start=d["new"][0], end=d["new"][1])
+                   if (x.source_uid, x.uid, x.rid) == (ev.source_uid, ev.uid, ev.rid) else x for x in evs]
+        return evs
+
+    def update(self):
+        """하루 종일 줄 수에 맞춰 머리 높이를 정하고 다시 그린다."""
+        days = self.days()
+        lanes = self._allday_lanes(days)
+        n = max((lane for _, lane in lanes), default=-1) + 1
+        self.head.set_content_height(self.HEAD + n * self.LANE + (6 if n else 0))
+        self.head.queue_draw()
+        self.body.queue_draw()
+
+    def _allday_lanes(self, days):
+        ws, we = days[0], days[-1]
+        items = []
+        for e in getattr(self.win, "events", []):
+            if not e.all_day:
+                continue
+            f, l = e.days()
+            if f <= we and l >= ws:
+                items.append((e, f, l))
+        items.sort(key=lambda x: (x[1], -(x[2] - x[1]).days, x[0].summary))
+        used, out = set(), []
+        for e, f, l in items:
+            cols = range((max(f, ws) - ws).days, (min(l, we) - ws).days + 1)
+            lane = 0
+            while any((lane, c) in used for c in cols):
+                lane += 1
+            used.update((lane, c) for c in cols)
+            out.append(((e, cols), lane))
+        return out
+
+    # ── 좌표 ──
+    def _colw(self, width):
+        return (width - self.GUTTER) / 7
+
+    def _at(self, x, y):
+        """본문 좌표 → (날짜, 그날 0시부터 분) — 분은 SNAP 단위로 맞춤."""
+        colw = self._colw(self.body.get_width())
+        i = min(max(int((x - self.GUTTER) // colw), 0), 6)
+        minutes = min(max(y / self.HOUR * 60, 0), 24 * 60)
+        minutes = int(round(minutes / self.SNAP) * self.SNAP)
+        return self.days()[i], minutes
+
+    def _dt(self, day, minutes):
+        return datetime.combine(day, time()) + timedelta(minutes=minutes)
+
+    def _hit(self, x, y):
+        for rx, ry, rw, rh, ev in reversed(self._rects):
+            if rx <= x <= rx + rw and ry <= y <= ry + rh:
+                return ev, (y > ry + rh - 7)  # 아래 끝 7px 는 길이 조절
+        return None, False
+
+    def _scroll_to_morning(self):
+        if not self._scrolled:
+            self._scrolled = True
+            self.scroller.get_vadjustment().set_value(8 * self.HOUR - 8)
+        return False
+
+    # ── 그리기 ──
+    def _colors(self):
+        fg = self.get_color()
+        accent = Adw.StyleManager.get_default().get_accent_color_rgba()
+        return fg, accent
+
+    def _draw_head(self, area, cr, width, height):
+        fg, accent = self._colors()
+        colw = self._colw(width)
+        today = date.today()
+        red, blue = rgba("#e5484d"), rgba("#3584e4")
+        off_days = {d for e in getattr(self.win, "events", []) if e.day_off for d in self.days() if e.covers(d)}
+        for i, d in enumerate(self.days()):
+            x = self.GUTTER + i * colw
+            if d == self.win.selected:
+                set_src(cr, accent, 0.10)
+                cr.rectangle(x, 0, colw, height)
+                cr.fill()
+            color = red if (d.weekday() == 6 or d in off_days) else blue if d.weekday() == 5 else fg
+            text(cr, self, WEEKDAYS[d.weekday()], x, 4, colw, size=8, color=color, align=Pango.Alignment.CENTER)
+            if d == today:
+                set_src(cr, accent)
+                cr.arc(x + colw / 2, 31, 12, 0, 6.2832)
+                cr.fill()
+                color = rgba("white")
+            text(cr, self, str(d.day), x, 22, colw, size=11, bold=True, color=color, align=Pango.Alignment.CENTER)
+        # 하루 종일 막대
+        self._head_rects = []
+        for (e, cols), lane in self._allday_lanes(self.days()):
+            x = self.GUTTER + cols[0] * colw + 2
+            w = len(cols) * colw - 4
+            y = self.HEAD + lane * self.LANE + 2
+            c = rgba(self.win.store.colors.get(e.source_uid, "#62a0ea"))
+            set_src(cr, c, 0.28)
+            round_rect(cr, x, y, w, self.LANE - 4, 4)
+            cr.fill()
+            set_src(cr, c)
+            cr.rectangle(x, y, 3, self.LANE - 4)
+            cr.fill()
+            text(cr, self, e.summary, x + 7, y + 2, w - 10, size=8.5, bold=True, color=fg)
+            self._head_rects.append((x, y, w, self.LANE - 4, e))
+
+    def _draw_body(self, area, cr, width, height):
+        fg, accent = self._colors()
+        colw = self._colw(width)
+        days = self.days()
+        today = date.today()
+        # 오늘·선택한 날 배경
+        for i, d in enumerate(days):
+            if d == self.win.selected:
+                set_src(cr, accent, 0.06)
+                cr.rectangle(self.GUTTER + i * colw, 0, colw, height)
+                cr.fill()
+        # 시간 줄
+        for h in range(24):
+            y = h * self.HOUR
+            set_src(cr, fg, 0.10)
+            cr.rectangle(self.GUTTER, y, width - self.GUTTER, 1)
+            cr.fill()
+            if h:
+                text(cr, self, f"{h:02d}:00", 4, y - 7, self.GUTTER - 10, size=8, color=rgba(fg.to_string(), 0.55),
+                     align=Pango.Alignment.RIGHT)
+        for i in range(8):
+            set_src(cr, fg, 0.08)
+            cr.rectangle(self.GUTTER + i * colw, 0, 1, height)
+            cr.fill()
+
+        # 일정
+        self._rects = []
+        dragging = self._drag["event"] if self._drag and self._drag.get("active") else None
+        for i, d in enumerate(days):
+            d0 = datetime.combine(d, time())
+            d1 = d0 + timedelta(days=1)
+            segs = []
+            for e in self.events():
+                if e.all_day:
+                    continue
+                s, en = max(e.start, d0), min(max(e.end, e.start + timedelta(minutes=15)), d1)
+                if en > s:
+                    segs.append((s, en, e))
+            for s, en, e, col, n in self._layout(segs):
+                x = self.GUTTER + i * colw + 2 + col * (colw - 4) / n
+                w = (colw - 4) / n - 2
+                y = (s - d0).total_seconds() / 3600 * self.HOUR + 1
+                h = max((en - s).total_seconds() / 3600 * self.HOUR - 2, 18)
+                c = rgba(self.win.store.colors.get(e.source_uid, "#62a0ea"))
+                live = dragging is not None and e.uid == dragging.uid and e.rid == dragging.rid
+                set_src(cr, c, 0.45 if live else 0.25)
+                round_rect(cr, x, y, w, h, 5)
+                cr.fill()
+                set_src(cr, c)
+                cr.rectangle(x, y, 3, h)
+                cr.fill()
+                if live:
+                    set_src(cr, accent)
+                    cr.set_line_width(1.5)
+                    round_rect(cr, x + 0.75, y + 0.75, w - 1.5, h - 1.5, 5)
+                    cr.stroke()
+                lines = max(int((h - 4) // 14), 1)
+                used = text(cr, self, e.summary, x + 7, y + 2, w - 9, size=8.5, bold=True, color=fg,
+                            lines=min(lines, 2))
+                if h - used > 18:
+                    text(cr, self, f"{e.start:%H:%M}–{e.end:%H:%M}", x + 7, y + 2 + used, w - 9, size=8,
+                         color=rgba(fg.to_string(), 0.7))
+                self._rects.append((x, y, w, h, e))
+
+        # 새 일정 범위
+        d = self._drag
+        if d and d.get("active") and d.get("event") is None and d.get("new"):
+            s, en = d["new"]
+            i = days.index(s.date())
+            y0 = (s - datetime.combine(s.date(), time())).total_seconds() / 3600 * self.HOUR
+            y1 = (en - datetime.combine(s.date(), time())).total_seconds() / 3600 * self.HOUR
+            set_src(cr, accent, 0.35)
+            round_rect(cr, self.GUTTER + i * colw + 2, y0 + 1, colw - 4, max(y1 - y0 - 2, 10), 5)
+            cr.fill()
+            text(cr, self, f"{s:%H:%M}–{en:%H:%M}", self.GUTTER + i * colw + 8, y0 + 3, colw - 12, size=8.5,
+                 bold=True, color=fg)
+
+        # 지금 시각
+        if today in days:
+            now = datetime.now()
+            i = days.index(today)
+            y = (now.hour + now.minute / 60) * self.HOUR
+            red = rgba("#e5484d")
+            set_src(cr, red)
+            cr.rectangle(self.GUTTER + i * colw, y - 1, colw, 2)
+            cr.fill()
+            cr.arc(self.GUTTER + i * colw, y, 4, 0, 6.2832)
+            cr.fill()
+
+    @staticmethod
+    def _layout(segs):
+        """겹치는 일정을 나란히 놓을 열 번호와 열 개수."""
+        segs.sort(key=lambda x: (x[0], -(x[1] - x[0]).total_seconds()))
+        out, cluster, cols, end = [], [], [], None
+
+        def flush():
+            out.extend((s, e, ev, col, len(cols)) for s, e, ev, col in cluster)
+
+        for s, e, ev in segs:
+            if cluster and s >= end:
+                flush()
+                cluster, cols, end = [], [], None
+            for i, c_end in enumerate(cols):
+                if c_end <= s:
+                    cols[i] = e
+                    col = i
+                    break
+            else:
+                cols.append(e)
+                col = len(cols) - 1
+            cluster.append((s, e, ev, col))
+            end = e if end is None else max(end, e)
+        flush()
+        return out
+
+    # ── 마우스 ──
+    def _motion(self, _c, x, y):
+        ev, edge = self._hit(x, y)
+        self.body.set_cursor_from_name("ns-resize" if edge else "grab" if ev else "default")
+
+    def _begin(self, _g, x, y):
+        ev, edge = self._hit(x, y)
+        day, minutes = self._at(x, y)
+        self._drag = {"x": x, "y": y, "event": ev, "active": False, "new": None,
+                      "mode": "resize" if edge else "move" if ev else "create",
+                      "anchor": self._dt(day, minutes)}
+        if ev is not None:
+            self._drag["grab"] = self._dt(day, minutes) - ev.start  # 잡은 곳과 시작의 차이
+
+    def _update(self, g, dx, dy):
+        d = self._drag
+        if d is None:
+            return
+        if not d["active"]:
+            if dx * dx + dy * dy < 25:
+                return
+            d["active"] = True
+            g.set_state(Gtk.EventSequenceState.CLAIMED)
+        day, minutes = self._at(d["x"] + dx, d["y"] + dy)
+        at = self._dt(day, minutes)
+        ev = d["event"]
+        if d["mode"] == "move":
+            s = at - d["grab"]
+            d["new"] = (s, s + (ev.end - ev.start))
+        elif d["mode"] == "resize":
+            d["new"] = (ev.start, max(at, ev.start + timedelta(minutes=self.SNAP)))
+        else:
+            a = d["anchor"]
+            day0 = datetime.combine(a.date(), time())
+            at = min(max(at, day0), day0 + timedelta(days=1))  # 새 일정은 한 날 안에서만
+            lo, hi = min(a, at), max(a, at)
+            if hi - lo < timedelta(minutes=self.SNAP):
+                hi = lo + timedelta(minutes=self.SNAP)
+            d["new"] = (lo, hi)
+        self.body.queue_draw()
+
+    def _end(self, _g, dx, dy):
+        d, self._drag = self._drag, None
+        if d is None:
+            return
+        win = self.win
+        if not d["active"]:  # 그냥 클릭
+            if win.get_visible_dialog() is not None:
+                return
+            if d["event"] is not None:
+                EventDialog(win, event=d["event"]).present(win)
+            else:
+                win.selected = d["anchor"].date()
+                win.on_selection_changed()
+            return
+        if d["new"] is None:
+            self.body.queue_draw()
+            return
+        if d["event"] is not None:
+            win.apply_times(d["event"], *d["new"])
+            self.body.queue_draw()
+        elif not win.store.writable(ECal.ClientSourceType.EVENTS):
+            win.toast("캘린더에 아직 연결 중이에요")
+            self.body.queue_draw()
+        else:
+            win.selected = d["new"][0].date()
+            win.on_selection_changed()
+            EventDialog(win, times=d["new"]).present(win)
+
+    def _body_pressed(self, _g, n_press, x, y):
+        if n_press == 2 and self._hit(x, y)[0] is None and self.win.get_visible_dialog() is None:
+            day, minutes = self._at(x, y)
+            s = self._dt(day, minutes - minutes % 60)
+            EventDialog(self.win, times=(s, s + timedelta(hours=1))).present(self.win)
+
+    def _head_released(self, _g, _n, x, y):
+        for rx, ry, rw, rh, e in self._head_rects:
+            if rx <= x <= rx + rw and ry <= y <= ry + rh:
+                EventDialog(self.win, event=e).present(self.win)
+                return
+        if x > self.GUTTER:
+            i = min(int((x - self.GUTTER) // self._colw(self.head.get_width())), 6)
+            self.win.selected = self.days()[i]
+            self.win.on_selection_changed()
+
+
 class NotionSetupDialog(Adw.Dialog):
     """노션 통합 토큰 입력 + 연결 확인."""
 
@@ -1069,15 +1477,21 @@ class Window(Adw.ApplicationWindow):
         nav = Gtk.Box(spacing=6, margin_start=12, margin_end=12, margin_top=8, margin_bottom=4)
         self.month_label = Gtk.Label(xalign=0, hexpand=True)
         self.month_label.add_css_class("title-1")
-        prev = Gtk.Button(icon_name="go-previous-symbolic", tooltip_text="이전 달 (Page Up)")
-        nxt = Gtk.Button(icon_name="go-next-symbolic", tooltip_text="다음 달 (Page Down)")
+        prev = Gtk.Button(icon_name="go-previous-symbolic", tooltip_text="이전 (Page Up)")
+        nxt = Gtk.Button(icon_name="go-next-symbolic", tooltip_text="다음 (Page Down)")
         today = Gtk.Button(label="오늘", tooltip_text="오늘로 (Ctrl+T)")
-        prev.connect("clicked", lambda *_: self.shift_month(-1))
-        nxt.connect("clicked", lambda *_: self.shift_month(1))
+        prev.connect("clicked", lambda *_: self.shift_period(-1))
+        nxt.connect("clicked", lambda *_: self.shift_period(1))
+        self.view_toggle = Adw.ToggleGroup(valign=Gtk.Align.CENTER)
+        self.view_toggle.add(Adw.Toggle(name="month", label="월"))
+        self.view_toggle.add(Adw.Toggle(name="week", label="주"))
+        self.view_toggle.set_active_name("month")
+        self.view_toggle.connect("notify::active-name", lambda *_: self.set_view(self.view_toggle.get_active_name()))
         today.connect("clicked", lambda *_: self.go_today())
         for b in (prev, nxt, today):
             b.add_css_class("flat")
         nav.append(self.month_label)
+        nav.append(self.view_toggle)
         nav.append(today)
         nav.append(prev)
         nav.append(nxt)
@@ -1124,9 +1538,13 @@ class Window(Adw.ApplicationWindow):
                 grid.attach(btn, c, r + 1, 1, 1)
                 self.cells.append(btn)
 
+        self.week = WeekView(self)
+        self.view_stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE, vexpand=True)
+        self.view_stack.add_named(grid, "month")
+        self.view_stack.add_named(self.week, "week")
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         content.append(nav)
-        content.append(grid)
+        content.append(self.view_stack)
 
         # 오른쪽: 선택한 날 일정
         side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
@@ -1215,8 +1633,8 @@ class Window(Adw.ApplicationWindow):
         for name, accels, fn in (
             ("new", ["<Control>n"], lambda *_: self.new_event() if self.stack.get_visible_child_name() == "calendar" else self.task_entry.grab_focus()),
             ("today", ["<Control>t"], lambda *_: self.go_today()),
-            ("prev", ["Page_Up"], lambda *_: self.shift_month(-1)),
-            ("next", ["Page_Down"], lambda *_: self.shift_month(1)),
+            ("prev", ["Page_Up"], lambda *_: self.shift_period(-1)),
+            ("next", ["Page_Down"], lambda *_: self.shift_period(1)),
         ):
             act = Gio.SimpleAction.new(name, None)
             act.connect("activate", fn)
@@ -1232,6 +1650,7 @@ class Window(Adw.ApplicationWindow):
         self.sidebar_btn.set_visible(self.stack.get_visible_child_name() == "calendar" and self.split.get_collapsed())
 
     def _tick(self):
+        self.week.body.queue_draw()
         if date.today() != self._today:
             self._today = date.today()
             self.refresh()
@@ -1242,6 +1661,36 @@ class Window(Adw.ApplicationWindow):
         y, m = y + (m - 1) // 12, (m - 1) % 12 + 1
         self.month = date(y, m, 1)
         self.refresh()
+
+    def shift_period(self, n):
+        if self.view_stack.get_visible_child_name() == "week":
+            self.select_day(self.selected + timedelta(days=7 * n))
+        else:
+            self.shift_month(n)
+
+    def set_view(self, name):
+        if name and name != self.view_stack.get_visible_child_name():
+            self.view_stack.set_visible_child_name(name)
+            self.refresh()
+
+    def on_selection_changed(self):
+        """선택한 날만 바뀌었을 때 (같은 달 안)."""
+        if (self.selected.year, self.selected.month) != (self.month.year, self.month.month):
+            self.select_day(self.selected)
+            return
+        self._render_selection()
+        self._render_day()
+        self._update_title()
+        if self.split.get_collapsed():
+            self.split.set_show_sidebar(True)
+
+    def _update_title(self):
+        if self.view_stack.get_visible_child_name() == "week":
+            a, b = self.week.days()[0], self.week.days()[-1]
+            end = f"{b.day}일" if a.month == b.month else f"{b.month}월 {b.day}일"
+            self.month_label.set_label(f"{a.year}년 {a.month}월 {a.day}일 – {end}")
+        else:
+            self.month_label.set_label(f"{self.month.year}년 {self.month.month}월")
 
     def go_today(self):
         self.select_day(date.today())
@@ -1287,47 +1736,57 @@ class Window(Adw.ApplicationWindow):
             return False
         if state & (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.ALT_MASK):
             return False
-        d = self.selected + timedelta(days=self.ARROWS[keyval])
-        if (d.year, d.month) != (self.month.year, self.month.month):
-            self.select_day(d)
-        else:
-            self.selected = d
-            self._render_selection()
-            self._render_day()
+        self.selected += timedelta(days=self.ARROWS[keyval])
+        self.on_selection_changed()
         return True
 
     # ── 드래그: 일정 막대를 끌어 늘리기 / 빈 칸을 끌어 여러 날 일정 만들기 ──
     def _cell_at(self, x, y):
-        """그리드 좌표 → (칸 버튼, 그 위의 일정 | None)"""
+        """그리드 좌표 → (칸 버튼, 그 위의 일정 | None, 일정 막대 위젯 | None)"""
         w = self.grid.pick(x, y, Gtk.PickFlags.DEFAULT)
-        event = None
+        event = chip = None
         while w is not None and w is not self.grid:
             if event is None and getattr(w, "event", None) is not None:
-                event = w.event
+                event, chip = w.event, w
             if hasattr(w, "cell"):
-                return w, event
+                return w, event, chip
             w = w.get_parent()
-        return None, None
+        return None, None, None
+
+    EDGE = 10  # 막대 끝에서 이만큼(px) 안쪽을 잡으면 늘리기·줄이기
+
+    def _chip_edge(self, chip, lx):
+        """막대 위 x 좌표 → 'start' | 'end' | None (첫날 왼쪽 끝 / 마지막 날 오른쪽 끝만)"""
+        if lx < self.EDGE and chip.day == chip.event.days()[0]:
+            return "start"
+        if lx > chip.get_width() - self.EDGE and chip.day == chip.event.days()[1]:
+            return "end"
+        return None
 
     @staticmethod
     def _drag_range(d):
         if d["event"] is not None:
             first, last = d["event"].days()
             t = d["target"]
-            if d["origin"] == first and last > first:
-                # 여러 날 일정의 첫날을 잡았으면 시작일을 움직인다 (오른쪽으로 끌면 줄어듦)
+            if d["mode"] == "start":  # 왼쪽 끝: 시작일
                 return (t, last) if t <= last else (last, t)
-            # 그 외(마지막 날·중간·하루짜리)는 끝나는 날을 움직인다 (왼쪽으로 끌면 줄어듦)
-            return (first, t) if t >= first else (t, last)
+            if d["mode"] == "end":  # 오른쪽 끝: 끝나는 날
+                return (first, t) if t >= first else (t, first)
+            off = t - d["origin"]  # 가운데: 통째로 옮기기
+            return first + off, last + off
         a, b = d["origin"], d["target"]
         return (a, b) if a <= b else (b, a)
 
     def _drag_begin(self, _g, x, y):
-        btn, event = self._cell_at(x, y)
+        btn, event, chip = self._cell_at(x, y)
         self._drag = None
         if btn is not None and btn.cell["date"] is not None:
+            mode = None
+            if chip is not None:
+                ok, p = self.grid.compute_point(chip, Graphene.Point().init(x, y))
+                mode = (self._chip_edge(chip, p.x) if ok else None) or "move"
             self._drag = {"x": x, "y": y, "origin": btn.cell["date"], "target": btn.cell["date"],
-                          "event": event, "active": False}
+                          "event": event, "mode": mode, "active": False}
 
     def _drag_update(self, g, dx, dy):
         d = self._drag
@@ -1338,7 +1797,7 @@ class Window(Adw.ApplicationWindow):
                 return
             d["active"] = True
             g.set_state(Gtk.EventSequenceState.CLAIMED)
-        btn, _ = self._cell_at(d["x"] + dx, d["y"] + dy)
+        btn, _, _ = self._cell_at(d["x"] + dx, d["y"] + dy)
         if btn is None or (d.get("shown") == btn.cell["date"]):
             return
         d["target"] = d["shown"] = btn.cell["date"]
@@ -1397,11 +1856,16 @@ class Window(Adw.ApplicationWindow):
         """일정을 first~last 날짜에 걸치도록 바꾼다 (시각은 그대로)."""
         if (first, last) == ev.days():
             return
+        self.apply_times(ev, *self._stretched(ev, first, last))
+
+    def apply_times(self, ev, s, e):
+        """일정의 시작·끝을 바꿔 저장한다 (드래그용)."""
+        if (s, e) == (ev.start, ev.end):
+            return
         if ev.source_uid not in self.store.writable(ECal.ClientSourceType.EVENTS):
             self.toast("읽기 전용 캘린더라 바꿀 수 없어요")
             self.refresh()
             return
-        s, e = self._stretched(ev, first, last)
         comp = ECal.Component.new_from_icalcomponent(ev.icomp.clone())
         mod = ECal.ObjModType.ALL
         if ev.recurring:
@@ -1537,7 +2001,7 @@ class Window(Adw.ApplicationWindow):
                 for e in self.events
             ]
         self.all_tasks = self.store.tasks()
-        self.month_label.set_label(f"{first.year}년 {first.month}월")
+        self._update_title()
         self._grid_start = start
         self._preview = None
         self._render_grid(self.events)
@@ -1618,11 +2082,16 @@ class Window(Adw.ApplicationWindow):
                     lab.add_css_class("cont-left")
                 if d < el:
                     lab.add_css_class("cont-right")
-                lab.event = e
+                lab.event, lab.day = e, d
                 if e is self._preview:
                     lab.add_css_class("dragging")
                 lab.set_cursor_from_name("grabbing" if e is self._preview else "grab")
-                lab.set_tooltip_text(f"{e.summary}\n끌어서 기간 늘리기")
+                if d in (ef, el):  # 끝을 잡을 수 있는 칸: 가장자리에서 커서를 ↔ 로
+                    motion = Gtk.EventControllerMotion()
+                    motion.connect("motion", lambda _c, x, _y, lab=lab: lab.set_cursor_from_name(
+                        "ew-resize" if self._chip_edge(lab, x) else "grab"))
+                    lab.add_controller(motion)
+                lab.set_tooltip_text(f"{e.summary}\n끌어서 옮기기 · 끝을 잡고 끌면 기간 조절")
                 chips.append(lab)
             if hidden:
                 more = Gtk.Label(label=f"+{hidden}개", xalign=0)
@@ -1634,6 +2103,7 @@ class Window(Adw.ApplicationWindow):
     def _render_selection(self):
         for btn in self.cells:
             (btn.add_css_class if btn.cell["date"] == self.selected else btn.remove_css_class)("selected-day")
+        self.week.update()
 
     def _render_day(self):
         d = self.selected
