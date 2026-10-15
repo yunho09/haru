@@ -1049,6 +1049,7 @@ class Window(Adw.ApplicationWindow):
                                  GObject.BindingFlags.BIDIRECTIONAL | GObject.BindingFlags.SYNC_CREATE)
         self.split.connect("notify::collapsed", lambda *_: self._sync_header())
 
+        self._overrides = {}  # (캘린더, uid, rid) → 저장 중인 (시작, 끝)
         self._shortcuts()
         self.connect("close-request", lambda *_: self._flush_memo() and False)
         keys = Gtk.EventControllerKey()
@@ -1313,7 +1314,11 @@ class Window(Adw.ApplicationWindow):
         if d["event"] is not None:
             first, last = d["event"].days()
             t = d["target"]
-            return (t, last) if t < first else (first, t)
+            if d["origin"] == first and last > first:
+                # 여러 날 일정의 첫날을 잡았으면 시작일을 움직인다 (오른쪽으로 끌면 줄어듦)
+                return (t, last) if t <= last else (last, t)
+            # 그 외(마지막 날·중간·하루짜리)는 끝나는 날을 움직인다 (왼쪽으로 끌면 줄어듦)
+            return (first, t) if t >= first else (t, last)
         a, b = d["origin"], d["target"]
         return (a, b) if a <= b else (b, a)
 
@@ -1410,10 +1415,16 @@ class Window(Adw.ApplicationWindow):
         comp.set_dtend(comp_dt(e))
         comp.commit_sequence()
 
+        # 구글 저장은 서버까지 다녀와서 1초 남짓 걸린다. 그동안 바뀐 길이를 먼저 보여준다
+        key = (ev.source_uid, ev.uid, ev.rid)
+        self._overrides[key] = (s, e)
+        self.refresh()
+
         def done(err):
+            self._overrides.pop(key, None)
             if err:
                 self.toast(f"변경 실패: {err}")
-                self.refresh()
+                self.refresh()  # 원래 길이로 되돌린다
             elif ev.recurring:
                 self.toast("반복 일정은 이 회차만 바꿨어요")
 
@@ -1519,6 +1530,12 @@ class Window(Adw.ApplicationWindow):
         start = first - timedelta(days=(first.weekday() + 1) % 7)  # 일요일 시작
         end = start + timedelta(days=42)
         self.events = self.store.events(start, end)
+        if self._overrides:  # 저장 중인 드래그 결과를 먼저 반영
+            self.events = [
+                replace(e, start=self._overrides[k][0], end=self._overrides[k][1])
+                if (k := (e.source_uid, e.uid, e.rid)) in self._overrides else e
+                for e in self.events
+            ]
         self.all_tasks = self.store.tasks()
         self.month_label.set_label(f"{first.year}년 {first.month}월")
         self._grid_start = start
