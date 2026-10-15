@@ -113,13 +113,18 @@ class Event:
     recurring: bool
     day_off: bool = False  # 공휴일(빨간 날)
 
-    def covers(self, d):
+    def days(self):
+        """일정이 걸친 (첫날, 마지막날) — 둘 다 포함."""
         if self.all_day:
-            return self.start <= d < max(self.end, self.start + timedelta(days=1))
+            return self.start, max(self.end - timedelta(days=1), self.start)
         s, e = self.start.date(), self.end.date()
         if self.end.time() == time(0, 0) and e > s:
             e -= timedelta(days=1)  # 자정에 끝나면 그 날은 포함 안 함
-        return s <= d <= e
+        return s, e
+
+    def covers(self, d):
+        first, last = self.days()
+        return first <= d <= last
 
 
 @dataclass
@@ -565,7 +570,7 @@ def set_reminder(comp, idx):
 
 
 class EventDialog(Adw.Dialog):
-    def __init__(self, win, day=None, event=None):
+    def __init__(self, win, day=None, event=None, span=None):
         super().__init__(title="일정 편집" if event else "새 일정", content_width=440)
         self.win, self.store, self.event = win, win.store, event
         cal_uids = self.store.writable(ECal.ClientSourceType.EVENTS)
@@ -582,6 +587,8 @@ class EventDialog(Adw.Dialog):
             hour = min(now.hour + 1, 23) if day == now.date() else 9
             base = datetime.combine(day, time(hour))
             start, end, all_day = base, base + timedelta(hours=1), False
+            if span:  # 달력에서 여러 날을 끌어 고른 경우: 하루 종일 일정
+                start, end, all_day = span[0], span[1] + timedelta(days=1), True
 
         page = Adw.PreferencesPage()
         g1 = Adw.PreferencesGroup()
@@ -967,6 +974,11 @@ class Window(Adw.ApplicationWindow):
         self.split.connect("notify::collapsed", lambda *_: self._sync_header())
 
         self._shortcuts()
+        keys = Gtk.EventControllerKey()
+        # 칸 버튼의 포커스 이동보다 먼저 받아서 방향키로 바로 날짜를 옮긴다
+        keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        keys.connect("key-pressed", self._on_key)
+        self.add_controller(keys)
         self.store = Store(self.refresh)
         self.store.on_error = self.toast
         # 자정이 지나면 '오늘' 표시를 갱신
@@ -994,6 +1006,15 @@ class Window(Adw.ApplicationWindow):
 
         grid = Gtk.Grid(row_homogeneous=False, column_homogeneous=True, hexpand=True, vexpand=True,
                         margin_start=8, margin_end=8, margin_bottom=8)
+        self.grid = grid
+        self._drag = None
+        drag = Gtk.GestureDrag()
+        # 칸 버튼보다 먼저 받아서, 실제로 끌었을 때만 이벤트를 가져간다(그냥 클릭은 버튼으로)
+        drag.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        drag.connect("drag-begin", self._drag_begin)
+        drag.connect("drag-update", self._drag_update)
+        drag.connect("drag-end", self._drag_end)
+        grid.add_controller(drag)
         for i, name in enumerate(["일", "월", "화", "수", "목", "금", "토"]):
             lab = Gtk.Label(label=name, margin_bottom=4)
             lab.add_css_class("caption-heading")
@@ -1154,6 +1175,123 @@ class Window(Adw.ApplicationWindow):
             self.selected = self._pressed_date
             self.new_event()
 
+    ARROWS = {Gdk.KEY_Left: -1, Gdk.KEY_Right: 1, Gdk.KEY_Up: -7, Gdk.KEY_Down: 7}
+
+    def _on_key(self, _ctrl, keyval, _code, state):
+        if keyval not in self.ARROWS or self.stack.get_visible_child_name() != "calendar":
+            return False
+        if self.get_visible_dialog() is not None or isinstance(self.get_focus(), (Gtk.Text, Gtk.Entry)):
+            return False
+        if state & (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.ALT_MASK):
+            return False
+        d = self.selected + timedelta(days=self.ARROWS[keyval])
+        if (d.year, d.month) != (self.month.year, self.month.month):
+            self.select_day(d)
+        else:
+            self.selected = d
+            self._render_selection()
+            self._render_day()
+        return True
+
+    # ── 드래그: 일정 막대를 끌어 늘리기 / 빈 칸을 끌어 여러 날 일정 만들기 ──
+    def _cell_at(self, x, y):
+        """그리드 좌표 → (칸 버튼, 그 위의 일정 | None)"""
+        w = self.grid.pick(x, y, Gtk.PickFlags.DEFAULT)
+        event = None
+        while w is not None and w is not self.grid:
+            if event is None and getattr(w, "event", None) is not None:
+                event = w.event
+            if hasattr(w, "cell"):
+                return w, event
+            w = w.get_parent()
+        return None, None
+
+    @staticmethod
+    def _drag_range(d):
+        if d["event"] is not None:
+            first, last = d["event"].days()
+            t = d["target"]
+            return (t, last) if t < first else (first, t)
+        a, b = d["origin"], d["target"]
+        return (a, b) if a <= b else (b, a)
+
+    def _drag_begin(self, _g, x, y):
+        btn, event = self._cell_at(x, y)
+        self._drag = None
+        if btn is not None and btn.cell["date"] is not None:
+            self._drag = {"x": x, "y": y, "origin": btn.cell["date"], "target": btn.cell["date"],
+                          "event": event, "active": False}
+
+    def _drag_update(self, g, dx, dy):
+        d = self._drag
+        if d is None:
+            return
+        if not d["active"]:
+            if dx * dx + dy * dy < 64:  # 8px 넘게 움직여야 드래그로 본다
+                return
+            d["active"] = True
+            g.set_state(Gtk.EventSequenceState.CLAIMED)
+        btn, _ = self._cell_at(d["x"] + dx, d["y"] + dy)
+        if btn is not None:
+            d["target"] = btn.cell["date"]
+        a, b = self._drag_range(d)
+        for cell in self.cells:
+            on = a <= cell.cell["date"] <= b
+            (cell.add_css_class if on else cell.remove_css_class)("drag-range")
+
+    def _drag_end(self, _g, _dx, _dy):
+        d, self._drag = self._drag, None
+        for cell in self.cells:
+            cell.remove_css_class("drag-range")
+        if d is None or not d["active"]:
+            return
+        a, b = self._drag_range(d)
+        if d["event"] is not None:
+            self.stretch(d["event"], a, b)
+        elif not self.store.writable(ECal.ClientSourceType.EVENTS):
+            self.toast("캘린더에 아직 연결 중이에요")
+        else:
+            self.selected = a
+            EventDialog(self, day=a, span=(a, b)).present(self)
+
+    def stretch(self, ev, first, last):
+        """일정을 first~last 날짜에 걸치도록 바꾼다 (시각은 그대로)."""
+        if (first, last) == ev.days():
+            return
+        if ev.source_uid not in self.store.writable(ECal.ClientSourceType.EVENTS):
+            self.toast("읽기 전용 캘린더라 바꿀 수 없어요")
+            return
+        if ev.all_day:
+            s, e = first, last + timedelta(days=1)
+        else:
+            s = datetime.combine(first, ev.start.time())
+            if ev.end.time() == time(0) and ev.end.date() > ev.start.date():
+                e = datetime.combine(last + timedelta(days=1), time(0))
+            else:
+                e = datetime.combine(last, ev.end.time())
+            if e <= s:
+                e = s + timedelta(hours=1)
+        comp = ECal.Component.new_from_icalcomponent(ev.icomp.clone())
+        mod = ECal.ObjModType.ALL
+        if ev.recurring:
+            # 반복 일정은 끌어 놓은 그 회차만 바꾼다
+            mod = ECal.ObjModType.THIS
+            comp.set_rrules(None)
+            comp.set_rdates(None)
+            comp.set_exrules(None)
+            comp.set_exdates(None)
+        comp.set_dtstart(comp_dt(s))
+        comp.set_dtend(comp_dt(e))
+        comp.commit_sequence()
+
+        def done(err):
+            if err:
+                self.toast(f"변경 실패: {err}")
+            elif ev.recurring:
+                self.toast("반복 일정은 이 회차만 바꿨어요")
+
+        self.store.modify(ev.source_uid, comp, mod, done)
+
     def _day_row_activated(self, _l, row):
         if getattr(row, "event", None):
             EventDialog(self, event=row.event).present(self)
@@ -1247,8 +1385,32 @@ class Window(Adw.ApplicationWindow):
         self.month_label.set_label(f"{first.year}년 {first.month}월")
 
         today = date.today()
+        lanes = {}  # (일정 id, 주 번호) → 줄 번호
+        for w in range(6):
+            wf = start + timedelta(days=7 * w)
+            wl = wf + timedelta(days=6)
+            week = []
+            for e in self.events:
+                ef, el = e.days()
+                if ef <= wl and el >= wf:
+                    week.append((e, ef, el))
+            # 여러 날·하루 종일 → 긴 것 → 이른 시각 순으로 위에서부터 줄 배정
+            week.sort(key=lambda x: (0 if (x[0].all_day or x[2] > x[1]) else 1, x[1], -(x[2] - x[1]).days,
+                                     time() if x[0].all_day else x[0].start.time(), x[0].summary))
+            used = {}
+            for e, ef, el in week:
+                cols = range((max(ef, wf) - wf).days, (min(el, wl) - wf).days + 1)
+                lane = 0
+                while any((lane, c) in used for c in cols):
+                    lane += 1
+                for c in cols:
+                    used[(lane, c)] = True
+                lanes[(id(e), w)] = lane
+
+        MAX_LANES = 3
         for i, btn in enumerate(self.cells):
             d = start + timedelta(days=i)
+            w = i // 7
             cell = btn.cell
             cell["date"] = d
             num = cell["num"]
@@ -1266,15 +1428,37 @@ class Window(Adw.ApplicationWindow):
             chips = cell["chips"]
             while (c := chips.get_first_child()) is not None:
                 chips.remove(c)
-            shown = day_events[:3]
-            for e in shown:
-                text = e.summary if e.all_day else f"{e.start:%H:%M} {e.summary}"
+            by_lane = {lanes[(id(e), w)]: e for e in day_events}
+            visible = [ln for ln in by_lane if ln < MAX_LANES]
+            hidden = len(by_lane) - len(visible)
+            for ln in range(max(visible) + 1 if visible else 0):
+                e = by_lane.get(ln)
+                if e is None:  # 다른 날의 막대 줄을 맞추기 위한 빈 자리
+                    lab = Gtk.Label(label=" ", hexpand=True)
+                    lab.add_css_class("chip")
+                    lab.add_css_class("gap")
+                    chips.append(lab)
+                    continue
+                ef, el = e.days()
+                multi = el > ef
+                if multi:
+                    # 이어진 막대: 첫날이나 주의 첫 칸에만 제목
+                    text = e.summary if (d == ef or d.weekday() == 6) else " "
+                else:
+                    text = e.summary if e.all_day else f"{e.start:%H:%M} {e.summary}"
                 lab = Gtk.Label(label=text, xalign=0, ellipsize=Pango.EllipsizeMode.END, max_width_chars=1, hexpand=True)
                 lab.add_css_class("chip")
                 lab.add_css_class(self._color_class.get(e.source_uid, "c0"))
+                if d > ef:
+                    lab.add_css_class("cont-left")
+                if d < el:
+                    lab.add_css_class("cont-right")
+                lab.event = e
+                lab.set_cursor_from_name("grab")
+                lab.set_tooltip_text(f"{e.summary}\n끌어서 기간 늘리기")
                 chips.append(lab)
-            if len(day_events) > 3:
-                more = Gtk.Label(label=f"+{len(day_events) - 3}개", xalign=0)
+            if hidden:
+                more = Gtk.Label(label=f"+{hidden}개", xalign=0)
                 more.add_css_class("more")
                 chips.append(more)
             btn.set_tooltip_text("\n".join(
@@ -1349,7 +1533,9 @@ class Window(Adw.ApplicationWindow):
 
 
 BASE_CSS = """
-.month-cell { padding: 4px; margin: 1px; border-radius: 10px; min-height: 64px; }
+.month-cell { padding: 4px 0; margin: 0; border-radius: 10px; min-height: 64px; }
+.month-cell .day-num { margin-left: 4px; }
+.month-cell.drag-range { background-color: alpha(@accent_bg_color, .22); }
 .month-cell.other-month { opacity: .45; }
 .month-cell.selected-day { background-color: alpha(@accent_bg_color, .14); box-shadow: inset 0 0 0 2px alpha(@accent_bg_color, .55); }
 .day-num { font-weight: 700; font-feature-settings: "tnum"; min-width: 24px; min-height: 24px; border-radius: 12px; padding: 0 2px; }
@@ -1357,7 +1543,10 @@ BASE_CSS = """
 .sun { color: #e5484d; }
 .sat { color: #3584e4; }
 .day-num.today.sun, .day-num.today.sat { color: @accent_fg_color; }
-.chip { font-size: 0.82em; padding: 1px 5px; border-radius: 4px; }
+.chip { font-size: 0.82em; padding: 1px 5px; border-radius: 4px; margin: 0 4px; }
+.month-cell .chip.gap { background: none; border: none; }
+.month-cell .chip.cont-left { margin-left: 0; border-left: none; border-top-left-radius: 0; border-bottom-left-radius: 0; }
+.month-cell .chip.cont-right { margin-right: 0; border-top-right-radius: 0; border-bottom-right-radius: 0; }
 .more { font-size: 0.78em; opacity: .7; padding-left: 4px; }
 .bar { border-radius: 2px; min-width: 4px; }
 row.overdue .subtitle { color: #e5484d; }
