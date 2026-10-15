@@ -138,6 +138,8 @@ class Store:
         self.views = []
         self.colors = {}
         self._pending = None
+        self._gen = 0
+        self.on_error = lambda msg: print(msg, file=sys.stderr)
         for sig in ("source-added", "source-removed", "source-enabled", "source-disabled"):
             self.registry.connect(sig, lambda *_: self.reconnect())
         self.reconnect()
@@ -147,6 +149,8 @@ class Store:
         return [s for s in self.registry.list_sources(ext) if s.get_enabled()]
 
     def reconnect(self):
+        # 이전 세대에서 아직 진행 중인 연결은 도착해도 버린다
+        self._gen += 1
         for v in self.views:
             try:
                 v.stop()
@@ -161,25 +165,30 @@ class Store:
         ):
             for src in self._sources(ext):
                 self.colors[src.get_uid()] = src.get_extension(ext).get_color() or "#62a0ea"
-                ECal.Client.connect(src, kind, 30, None, self._on_connected, None)
+                ECal.Client.connect(src, kind, 30, None, self._on_connected, self._gen)
         self.changed()
 
-    def _on_connected(self, _src, res, _data):
+    def _on_connected(self, _src, res, gen):
         try:
             client = ECal.Client.connect_finish(res)
         except GLib.Error as e:
             print("연결 실패:", e.message, file=sys.stderr)
             return
-        client.set_default_timezone(TZ)
         uid = client.get_source().get_uid()
+        src = self.source(uid)
+        if gen != self._gen or src is None or not src.get_enabled():
+            return
+        client.set_default_timezone(TZ)
         self.clients[uid] = client
-        client.get_view("#t", None, self._on_view, None)
+        client.get_view("#t", None, self._on_view, gen)
         self.changed()
 
-    def _on_view(self, client, res, _data):
+    def _on_view(self, client, res, gen):
         try:
             ok, view = client.get_view_finish(res)
         except GLib.Error:
+            return
+        if gen != self._gen:
             return
         for sig in ("objects-added", "objects-modified", "objects-removed"):
             view.connect(sig, lambda *_: self.changed())
@@ -217,7 +226,8 @@ class Store:
 
     def writable(self, kind):
         """쓰기 가능한 캘린더 목록. 구글(이메일 이름) 캘린더를 맨 앞에."""
-        items = [(uid, c) for uid, c in self._clients(kind) if not c.is_readonly() and uid != "birthdays"]
+        items = [(uid, c) for uid, c in self._clients(kind)
+                 if not c.is_readonly() and uid != "birthdays" and self.source(uid) is not None]
         items.sort(key=lambda x: (0 if self.source(x[0]).get_parent() not in ("local-stub", None) else 1, self.name(x[0])))
         return [uid for uid, _ in items]
 
@@ -293,16 +303,25 @@ class Store:
         return out
 
     # ── 쓰기 (모두 비동기, 결과는 done(err|None)) ──
+    def _client(self, source_uid, done):
+        client = self.clients.get(source_uid)
+        if client is None:
+            done("캘린더에 다시 연결하는 중이에요. 잠시 후 다시 해주세요")
+        return client
+
     def create(self, source_uid, comp, done):
-        client = self.clients[source_uid]
+        if not (client := self._client(source_uid, done)):
+            return
         client.create_object(comp.get_icalcomponent(), ECal.OperationFlags.NONE, None, self._finish("create", done), None)
 
     def modify(self, source_uid, comp, mod, done):
-        client = self.clients[source_uid]
+        if not (client := self._client(source_uid, done)):
+            return
         client.modify_object(comp.get_icalcomponent(), mod, ECal.OperationFlags.NONE, None, self._finish("modify", done), None)
 
     def remove(self, source_uid, uid, rid, mod, done):
-        client = self.clients[source_uid]
+        if not (client := self._client(source_uid, done)):
+            return
         client.remove_object(uid, rid or None, mod, ECal.OperationFlags.NONE, None, self._finish("remove", done), None)
 
     def move(self, old_src, new_src, comp, done):
@@ -310,18 +329,37 @@ class Store:
         uid = comp.get_uid()
         new = comp.clone()
         new.set_uid(str(uuid.uuid4()))
+        # 원래 캘린더에 묶인 정보(초대 조직자/참석자, 서버 전용 X- 속성)는 가져가지 않는다
+        new.set_organizer(None)
+        new.set_attendees(None)
+        ic = new.get_icalcomponent()
+        xs, p = [], ic.get_first_property(ICalGLib.PropertyKind.X_PROPERTY)
+        while p is not None:
+            xs.append(p)
+            p = ic.get_next_property(ICalGLib.PropertyKind.X_PROPERTY)
+        for p in xs:
+            ic.remove_property(p)
+
+        def after_remove(err):
+            if err:
+                # 새 캘린더에는 이미 만들어졌으니 저장은 성공으로 처리 (다시 누르면 중복됨)
+                self.on_error(f"옮긴 뒤 원래 일정 삭제 실패: {err}")
+            done(None)
 
         def after_create(err):
             if err:
                 done(err)
             else:
-                self.remove(old_src, uid, None, ECal.ObjModType.ALL, done)
+                self.remove(old_src, uid, None, ECal.ObjModType.ALL, after_remove)
 
         self.create(new_src, new, after_create)
 
     def master(self, source_uid, uid):
+        client = self.clients.get(source_uid)
+        if client is None:
+            return None
         try:
-            ok, icomp = self.clients[source_uid].get_object_sync(uid, None, None)
+            ok, icomp = client.get_object_sync(uid, None, None)
         except GLib.Error:
             return None
         return ECal.Component.new_from_icalcomponent(icomp)
@@ -350,6 +388,14 @@ class DateButton(Gtk.MenuButton):
         self.on_change = on_change
         self.cal = Gtk.Calendar()
         self.cal.connect("day-selected", self._picked)
+        # 화살표로 달을 넘기면 내부 날짜가 신호 없이 바뀌어서(3/5→4/5), 같은 날짜 숫자를
+        # 누르면 day-selected 가 안 온다. 클릭이 끝난 뒤 직접 확인한다.
+        self._navigated = False
+        for sig in ("prev-month", "next-month", "prev-year", "next-year"):
+            self.cal.connect(sig, self._on_nav)
+        click = Gtk.GestureClick()
+        click.connect("released", lambda *_: GLib.idle_add(self._after_click))
+        self.cal.add_controller(click)
         pop = Gtk.Popover(child=self.cal)
         self.set_popover(pop)
         self.set_date(d)
@@ -358,6 +404,16 @@ class DateButton(Gtk.MenuButton):
         self.value = d
         self.set_label(fmt_day(d))
         self.cal.select_day(GLib.DateTime.new_local(d.year, d.month, d.day, 0, 0, 0))
+
+    def _on_nav(self, *_):
+        self._navigated = True
+
+    def _after_click(self):
+        if self._navigated:
+            self._navigated = False
+        else:
+            self._picked(self.cal)
+        return False
 
     def _picked(self, cal):
         g = cal.get_date()
@@ -371,13 +427,13 @@ class DateButton(Gtk.MenuButton):
 
 
 class TimeEntry(Gtk.Box):
-    """시:분 입력 (분은 5분 단위)."""
+    """시:분 입력 (분 버튼은 5분씩)."""
 
     def __init__(self, t, on_change=None):
         super().__init__(spacing=4, valign=Gtk.Align.CENTER)
         self.on_change = on_change
         self.h = self._spin(23, 1)
-        self.m = self._spin(55, 5)
+        self.m = self._spin(59, 5)
         self.append(self.h)
         self.append(Gtk.Label(label=":"))
         self.append(self.m)
@@ -397,7 +453,7 @@ class TimeEntry(Gtk.Box):
 
     def set_time(self, t):
         self.h.set_value(t.hour)
-        self.m.set_value(t.minute - t.minute % 5)
+        self.m.set_value(t.minute)
 
     @property
     def value(self):
@@ -448,7 +504,9 @@ class EventDialog(Adw.Dialog):
             start, end, all_day = event.start, event.end, event.all_day
         else:
             now = datetime.now()
-            base = datetime.combine(day or now.date(), time((now.hour + 1) % 24))
+            day = day or now.date()
+            hour = min(now.hour + 1, 23) if day == now.date() else 9
+            base = datetime.combine(day, time(hour))
             start, end, all_day = base, base + timedelta(hours=1), False
 
         page = Adw.PreferencesPage()
@@ -465,6 +523,7 @@ class EventDialog(Adw.Dialog):
         sd = start if all_day else start.date()
         ed = (end - timedelta(days=1)) if all_day else end.date()
         ed = max(ed, sd)
+        self._start_prev = sd
         self.start_date = DateButton(sd, self._start_date_changed)
         self.end_date = DateButton(ed)
         t_s = time(9) if all_day else start.time()
@@ -477,7 +536,7 @@ class EventDialog(Adw.Dialog):
         r_end = Adw.ActionRow(title="종료")
         r_end.add_suffix(self.end_date)
         r_end.add_suffix(self.end_time)
-        self.all_day.connect("notify::active", lambda *_: self._sync_time_visibility())
+        self.all_day.connect("notify::active", lambda *_: self._all_day_toggled())
         for w in (self.all_day, r_start, r_end):
             g2.add(w)
         page.add(g2)
@@ -489,7 +548,8 @@ class EventDialog(Adw.Dialog):
             self.cal_uids = cal_uids
         sel = self.cal_uids.index(event.source_uid) if event and event.source_uid in self.cal_uids else 0
         self.calendar = combo_row("캘린더", [self.store.name(u) for u in self.cal_uids], sel)
-        self.reminder = combo_row("알림", [r[0] for r in REMINDERS], reminder_index(comp) if comp else DEFAULT_REMINDER)
+        self._reminder0 = reminder_index(comp) if comp else DEFAULT_REMINDER
+        self.reminder = combo_row("알림", [r[0] for r in REMINDERS], self._reminder0)
         desc = comp.get_descriptions() if comp else None
         self.memo = Adw.EntryRow(title="메모", text=text_of(desc[0]) if desc else "")
         for w in (self.calendar, self.reminder, self.memo):
@@ -529,9 +589,17 @@ class EventDialog(Adw.Dialog):
         self.start_time.set_visible(not on)
         self.end_time.set_visible(not on)
 
+    def _all_day_toggled(self):
+        # 23:00~다음날 00:00 같은 일정은 하루 종일로 바꾸면 하루짜리여야 한다
+        if (self.all_day.get_active() and self.end_time.value == time(0)
+                and self.end_date.value > self.start_date.value):
+            self.end_date.set_date(self.end_date.value - timedelta(days=1))
+        self._sync_time_visibility()
+
     def _start_date_changed(self, d):
-        if self.end_date.value < d:
-            self.end_date.set_date(d)
+        # 기간은 유지한 채 종료 날짜도 같이 옮긴다
+        self.end_date.set_date(self.end_date.value + (d - self._start_prev))
+        self._start_prev = d
 
     def _start_time_changed(self, t):
         if self.end_date.value == self.start_date.value:
@@ -542,7 +610,7 @@ class EventDialog(Adw.Dialog):
     def _values(self):
         if self.all_day.get_active():
             s = self.start_date.value
-            e = self.end_date.value + timedelta(days=1)
+            e = max(self.end_date.value, s) + timedelta(days=1)
         else:
             s = datetime.combine(self.start_date.value, self.start_time.value)
             e = datetime.combine(self.end_date.value, self.end_time.value)
@@ -551,7 +619,7 @@ class EventDialog(Adw.Dialog):
         return s, e
 
     def save(self):
-        if not hasattr(self, "save_btn"):
+        if not hasattr(self, "save_btn") or not self.save_btn.get_sensitive():
             return
         summary = self.title.get_text().strip() or "(제목 없음)"
         s, e = self._values()
@@ -567,10 +635,11 @@ class EventDialog(Adw.Dialog):
         def fill(comp, cs, ce):
             comp.set_summary(ECal.ComponentText.new(summary, None))
             comp.set_location(location)
-            comp.set_descriptions([ECal.ComponentText.new(memo, None)] if memo else None)
+            comp.set_descriptions([ECal.ComponentText.new(memo, None)] if memo else [])
             comp.set_dtstart(comp_dt(cs))
             comp.set_dtend(comp_dt(ce))
-            set_reminder(comp, reminder)
+            if self.event is None or reminder != self._reminder0:
+                set_reminder(comp, reminder)
             comp.commit_sequence()
             return comp
 
@@ -620,9 +689,13 @@ class EventDialog(Adw.Dialog):
             if master is None:
                 done("원본 일정을 찾을 수 없어요")
                 return
-            m_start = ical_to_py(master.get_dtstart().get_value())
             shift = as_date(s) - as_date(ev.start)
-            m_day = as_date(m_start) + shift
+            if shift.days != 0:
+                # 반복 규칙(예: 매주 월요일)은 그대로라 날짜만 옮기면 일정이 깨진다
+                done("모든 반복의 날짜는 바꿀 수 없어요. 시간·제목 등만 바꾸거나 '이 일정만'을 고르세요")
+                return
+            m_start = ical_to_py(master.get_dtstart().get_value())
+            m_day = as_date(m_start)
             ms = m_day if not isinstance(s, datetime) else datetime.combine(m_day, s.time())
             self.store.modify(src, fill(master, ms, ms + (e - s)), mod, done)
 
@@ -716,7 +789,7 @@ class TaskDialog(Adw.Dialog):
         comp.set_summary(ECal.ComponentText.new(self.title.get_text().strip() or "(제목 없음)", None))
         comp.set_due(comp_dt(self.due.value) if self.has_due.get_active() else None)
         memo = self.memo.get_text().strip()
-        comp.set_descriptions([ECal.ComponentText.new(memo, None)] if memo else None)
+        comp.set_descriptions([ECal.ComponentText.new(memo, None)] if memo else [])
         comp.commit_sequence()
 
         def done(err):
@@ -763,11 +836,11 @@ class Window(Adw.ApplicationWindow):
         self.add_breakpoint(bp)
         self.split.bind_property("show-sidebar", self.sidebar_btn, "active",
                                  GObject.BindingFlags.BIDIRECTIONAL | GObject.BindingFlags.SYNC_CREATE)
-        self.split.bind_property("collapsed", self.sidebar_btn, "visible",
-                                 GObject.BindingFlags.SYNC_CREATE)
+        self.split.connect("notify::collapsed", lambda *_: self._sync_header())
 
         self._shortcuts()
         self.store = Store(self.refresh)
+        self.store.on_error = self.toast
         # 자정이 지나면 '오늘' 표시를 갱신
         GLib.timeout_add_seconds(60, self._tick)
         self._today = date.today()
@@ -816,6 +889,8 @@ class Window(Adw.ApplicationWindow):
                 btn.set_child(box)
                 btn.connect("clicked", self._cell_clicked)
                 dbl = Gtk.GestureClick()
+                # 버튼 자체 클릭 제스처보다 먼저 받아야 두 번 클릭이 잡힌다
+                dbl.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
                 dbl.connect("pressed", self._cell_pressed, btn)
                 btn.add_controller(dbl)
                 btn.cell = {"num": num, "chips": chips, "date": None}
@@ -838,6 +913,7 @@ class Window(Adw.ApplicationWindow):
         self.day_tasks_title.add_css_class("heading")
         self.day_tasks = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
         self.day_tasks.add_css_class("boxed-list")
+        self.day_tasks.connect("row-activated", lambda _l, row: TaskDialog(self, row.task).present(self))
         add = Gtk.Button(label="일정 추가", halign=Gtk.Align.CENTER)
         add.add_css_class("pill")
         add.connect("clicked", lambda *_: self.new_event())
@@ -931,6 +1007,8 @@ class Window(Adw.ApplicationWindow):
 
     def _cell_clicked(self, btn):
         d = btn.cell["date"]
+        if d is None:  # 첫 그리기 전
+            return
         if d.month != self.month.month:
             self.select_day(d)
         else:
@@ -941,8 +1019,11 @@ class Window(Adw.ApplicationWindow):
                 self.split.set_show_sidebar(True)
 
     def _cell_pressed(self, gesture, n_press, _x, _y, btn):
-        if n_press == 2:
-            self.selected = btn.cell["date"]
+        # 첫 클릭에서 다른 달 칸이면 달력이 다시 그려져 칸의 날짜가 바뀌므로, 첫 클릭 때 날짜를 기억한다
+        if n_press == 1:
+            self._pressed_date = btn.cell["date"]
+        elif n_press == 2 and getattr(self, "_pressed_date", None):
+            self.selected = self._pressed_date
             self.new_event()
 
     def _day_row_activated(self, _l, row):
