@@ -10,6 +10,8 @@ import uuid
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
 
+import threading
+
 import gi
 
 gi.require_version("Gtk", "4.0")
@@ -18,6 +20,8 @@ gi.require_version("EDataServer", "1.2")
 gi.require_version("ECal", "2.0")
 gi.require_version("ICalGLib", "3.0")
 from gi.repository import Adw, ECal, EDataServer, Gdk, Gio, GLib, GObject, Gtk, ICalGLib, Pango  # noqa: E402
+
+import diary  # noqa: E402
 
 APP_ID = "io.github.yunho09.Haru"
 WEEKDAYS = ["월", "화", "수", "목", "금", "토", "일"]
@@ -135,6 +139,7 @@ class Task:
     due: object  # date | None
     done: bool
     icomp: object
+    completed: object = None  # 완료한 날 (date | None)
 
 
 class Store:
@@ -302,11 +307,12 @@ class Store:
                 d = ical_to_py(due.get_value()) if due else None
                 if isinstance(d, datetime):
                     d = d.date()
+                done_at = ical_to_py(comp.get_completed()) if comp.get_completed() else None
                 out.append(Task(
                     uid=comp.get_uid(), source_uid=uid,
                     summary=text_of(comp.get_summary()) or "(제목 없음)",
                     due=d, done=comp.get_status() == ICalGLib.PropertyStatus.COMPLETED,
-                    icomp=comp.get_icalcomponent(),
+                    icomp=comp.get_icalcomponent(), completed=as_date(done_at) if done_at else None,
                 ))
         out.sort(key=lambda t: (t.due is None, t.due or date.max, t.summary))
         return out
@@ -939,6 +945,73 @@ class TaskDialog(Adw.Dialog):
         self.win.store.modify(self.task.source_uid, comp, ECal.ObjModType.ALL, done)
 
 
+class NotionSetupDialog(Adw.Dialog):
+    """노션 통합 토큰 입력 + 연결 확인."""
+
+    def __init__(self, win, then=None):
+        super().__init__(title="노션 연결", content_width=460)
+        self.win, self.then = win, then
+        cfg = diary.load_config()
+        page = Adw.PreferencesPage()
+        g = Adw.PreferencesGroup(
+            description=(
+                "1. notion.so/profile/integrations 에서 새 통합(내부)을 만들고 토큰을 복사해요\n"
+                "2. 노션 📕 일기 데이터베이스 ⋯ 메뉴 → 연결 → 방금 만든 통합 추가\n"
+                "3. 아래에 토큰을 붙여넣고 연결 확인"
+            )
+        )
+        self.token = Adw.PasswordEntryRow(title="통합 토큰", text=cfg.get("token", ""))
+        self.token.connect("entry-activated", lambda *_: self.connect_check())
+        g.add(self.token)
+        page.add(g)
+        self.status = Gtk.Label(wrap=True, margin_start=12, margin_end=12, margin_bottom=12)
+        self.status.add_css_class("dim-label")
+        header = Adw.HeaderBar(show_end_title_buttons=False, show_start_title_buttons=False)
+        cancel = Gtk.Button(label="취소")
+        cancel.connect("clicked", lambda *_: self.close())
+        self.ok = Gtk.Button(label="연결 확인")
+        self.ok.add_css_class("suggested-action")
+        self.ok.connect("clicked", lambda *_: self.connect_check())
+        header.pack_start(cancel)
+        header.pack_end(self.ok)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box.append(page)
+        box.append(self.status)
+        tv = Adw.ToolbarView(content=box)
+        tv.add_top_bar(header)
+        self.set_child(tv)
+
+    def connect_check(self):
+        token = self.token.get_text().strip()
+        if not token:
+            return
+        cfg = diary.load_config()
+        cfg["token"] = token
+        self.ok.set_sensitive(False)
+        self.status.set_label("확인하는 중…")
+
+        def work():
+            try:
+                name, err = diary.check(cfg), None
+            except diary.NotionError as e:
+                name, err = None, str(e)
+            GLib.idle_add(done, name, err)
+
+        def done(name, err):
+            self.ok.set_sensitive(True)
+            if err:
+                self.status.set_label(err)
+                return False
+            diary.save_config(cfg)
+            self.win.toast(f"노션 '{name}' 에 연결했어요")
+            self.close()
+            if self.then:
+                self.then()
+            return False
+
+        threading.Thread(target=work, daemon=True).start()
+
+
 # ───────────────────────── 메인 창 ─────────────────────────
 
 class Window(Adw.ApplicationWindow):
@@ -977,6 +1050,7 @@ class Window(Adw.ApplicationWindow):
         self.split.connect("notify::collapsed", lambda *_: self._sync_header())
 
         self._shortcuts()
+        self.connect("close-request", lambda *_: self._flush_memo() and False)
         keys = Gtk.EventControllerKey()
         # 칸 버튼의 포커스 이동보다 먼저 받아서 방향키로 바로 날짜를 옮긴다
         keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
@@ -1061,15 +1135,40 @@ class Window(Adw.ApplicationWindow):
         self.day_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
         self.day_list.add_css_class("boxed-list")
         self.day_list.connect("row-activated", self._day_row_activated)
-        self.day_tasks_title = Gtk.Label(label="이날 마감인 할 일", xalign=0)
-        self.day_tasks_title.add_css_class("heading")
-        self.day_tasks = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
-        self.day_tasks.add_css_class("boxed-list")
-        self.day_tasks.connect("row-activated", lambda _l, row: TaskDialog(self, row.task).present(self))
         add = Gtk.Button(label="일정 추가", halign=Gtk.Align.CENTER)
         add.add_css_class("pill")
         add.connect("clicked", lambda *_: self.new_event())
-        for w in (self.day_title, self.day_list, self.day_tasks_title, self.day_tasks, add):
+
+        # 일일 투두: 그 날짜가 마감인 할 일 (구글 할 일과 동기화)
+        self.day_tasks_title = Gtk.Label(label="할 일", xalign=0, margin_top=8)
+        self.day_tasks_title.add_css_class("heading")
+        self.day_task_entry = Gtk.Entry(placeholder_text="이날 할 일 추가 후 Enter")
+        self.day_task_entry.connect("activate", lambda e: self.add_task(e.get_text(), self.selected, e))
+        self.day_tasks = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        self.day_tasks.add_css_class("boxed-list")
+        self.day_tasks.connect("row-activated", lambda _l, row: TaskDialog(self, row.task).present(self))
+
+        # 메모: 그날 기록 (로컬 저장, 노션 일기에 같이 올라감)
+        memo_title = Gtk.Label(label="메모", xalign=0, margin_top=8)
+        memo_title.add_css_class("heading")
+        self.memo_view = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR, top_margin=8, bottom_margin=8,
+                                      left_margin=10, right_margin=10)
+        self.memo_view.add_css_class("memo")
+        self.memo_view.get_buffer().connect("changed", self._memo_changed)
+        memo_frame = Gtk.Frame(child=self.memo_view, height_request=110)
+        self._memo_day = None
+        self._memo_timer = None
+        self._memo_loading = False
+
+        self.notion_btn = Gtk.Button(halign=Gtk.Align.CENTER, margin_top=4,
+                                     tooltip_text="할 일·일정·커밋·메모를 노션 📕 일기에 올려요")
+        self.notion_btn.set_child(Adw.ButtonContent(icon_name="document-send-symbolic", label="노션 일기에 올리기"))
+        self.notion_btn.add_css_class("pill")
+        self.notion_btn.add_css_class("suggested-action")
+        self.notion_btn.connect("clicked", lambda *_: self.upload_diary())
+
+        for w in (self.day_title, self.day_list, add, self.day_tasks_title, self.day_task_entry,
+                  self.day_tasks, memo_title, memo_frame, self.notion_btn):
             side.append(w)
         scroller = Gtk.ScrolledWindow(child=side, hscrollbar_policy=Gtk.PolicyType.NEVER)
 
@@ -1325,21 +1424,32 @@ class Window(Adw.ApplicationWindow):
             EventDialog(self, event=row.event).present(self)
 
     # ── 할 일 ──
-    def add_task(self):
-        text = self.task_entry.get_text().strip()
-        lists = self.store.writable(ECal.ClientSourceType.TASKS)
-        if not text or not lists:
+    def add_task(self, text=None, due=None, entry=None):
+        """할 일 추가. 인자 없이 부르면 할 일 탭의 입력칸을 쓴다."""
+        if text is None:
+            entry = self.task_entry
+            text = entry.get_text()
+            due = self.task_due.value if self.task_due_on.get_active() else None
+            lists = self.store.writable(ECal.ClientSourceType.TASKS)
+            src = lists[min(self.task_list_combo.get_selected(), len(lists) - 1)] if lists else None
+        else:
+            lists = self.store.writable(ECal.ClientSourceType.TASKS)
+            src = lists[0] if lists else None
+        text = text.strip()
+        if not text:
             return
-        src = lists[min(self.task_list_combo.get_selected(), len(lists) - 1)]
+        if src is None:
+            self.toast("할 일 목록에 아직 연결 중이에요")
+            return
         comp = ECal.Component.new()
         comp.set_new_vtype(ECal.ComponentVType.TODO)
         comp.set_uid(str(uuid.uuid4()))
         comp.set_summary(ECal.ComponentText.new(text, None))
         comp.set_status(ICalGLib.PropertyStatus.NEEDSACTION)
-        if self.task_due_on.get_active():
-            comp.set_due(comp_dt(self.task_due.value))
+        if due:
+            comp.set_due(comp_dt(due))
         comp.commit_sequence()
-        self.task_entry.set_text("")
+        entry.set_text("")
         self.store.create(src, comp, lambda err: err and self.toast(f"추가 실패: {err}"))
 
     def toggle_task(self, task, done):
@@ -1539,10 +1649,80 @@ class Window(Adw.ApplicationWindow):
 
         self.day_tasks.remove_all()
         due = [t for t in getattr(self, "all_tasks", []) if t.due == d]
-        self.day_tasks_title.set_visible(bool(due))
         self.day_tasks.set_visible(bool(due))
         for t in due:
             self.day_tasks.append(self._task_row(t))
+        self._load_memo(d)
+
+    # ── 메모 ──
+    def _load_memo(self, d):
+        if d == self._memo_day:
+            return
+        self._flush_memo()
+        self._memo_day = d
+        self._memo_loading = True
+        self.memo_view.get_buffer().set_text(diary.read_memo(d))
+        self._memo_loading = False
+
+    def _memo_changed(self, _buf):
+        if self._memo_loading:
+            return
+        if self._memo_timer:
+            GLib.source_remove(self._memo_timer)
+        self._memo_timer = GLib.timeout_add(600, self._flush_memo)
+
+    def _flush_memo(self):
+        if self._memo_timer:
+            GLib.source_remove(self._memo_timer)
+            self._memo_timer = None
+        if self._memo_day is not None:
+            buf = self.memo_view.get_buffer()
+            diary.write_memo(self._memo_day, buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False))
+        return False
+
+    # ── 노션 일기 ──
+    def upload_diary(self):
+        cfg = diary.load_config()
+        if not cfg.get("token"):
+            NotionSetupDialog(self, then=self.upload_diary).present(self)
+            return
+        self._flush_memo()
+        d = self.selected
+        # GI 객체는 메인 스레드에서만 다룬다: 할 일·일정은 여기서 문자열로 만들어 넘긴다
+        todos = [(t.summary, t.done) for t in self.all_tasks if t.due == d]
+        todos += [(t.summary, True) for t in self.all_tasks if t.done and t.completed == d and t.due != d]
+        events = []
+        for e in self.store.events(d, d + timedelta(days=1)):
+            if not e.covers(d) or self.store.is_holiday_source(e.source_uid) or e.source_uid == "birthdays":
+                continue
+            when = "하루 종일" if e.all_day else f"{e.start:%H:%M}–{e.end:%H:%M}"
+            events.append(f"{when}  {e.summary}" + (f"  @{e.location}" if e.location else ""))
+        memo = diary.read_memo(d)
+        self.notion_btn.set_sensitive(False)
+
+        def work():
+            try:
+                blocks = diary.build_entry(d, todos, events, diary.commits(d, cfg["project_root"]), memo)
+                if not blocks:
+                    raise diary.NotionError("올릴 내용이 없어요")
+                url, err = diary.push(cfg, d, blocks), None
+            except diary.NotionError as e:
+                url, err = None, str(e)
+            except Exception as e:  # 예상 못 한 오류도 버튼이 멈추지 않게
+                url, err = None, f"오류: {e}"
+            GLib.idle_add(finish, url, err)
+
+        def finish(url, err):
+            self.notion_btn.set_sensitive(True)
+            if err:
+                self.toast(err)
+                return False
+            t = Adw.Toast(title=f"{diary.title_for(d)} 일기를 올렸어요", button_label="열기", timeout=6)
+            t.connect("button-clicked", lambda *_: Gio.AppInfo.launch_default_for_uri(url, None))
+            self.toasts.add_toast(t)
+            return False
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _render_tasks(self):
         lists = self.store.writable(ECal.ClientSourceType.TASKS)
@@ -1587,6 +1767,7 @@ BASE_CSS = """
 .more { font-size: 0.78em; opacity: .7; padding-left: 4px; }
 .bar { border-radius: 2px; min-width: 4px; }
 row.overdue .subtitle { color: #e5484d; }
+textview.memo, textview.memo text { background: transparent; }
 """
 
 

@@ -17,6 +17,10 @@ GNOME용 가벼운 일정·할 일 관리 앱. GTK4 + libadwaita (Python).
 - 반복 일정은 "이 일정만 / 모든 반복" 으로 수정·삭제 (반복 방식을 바꾸면 전체에 적용)
 - 공휴일(구글 "대한민국의 휴일")은 빨간 날로 표시, 기념일은 제외
 - 할 일 목록: 추가, 마감일, 완료 체크, 완료됨 접기
+- 일일 투두: 사이드바에서 그 날짜 마감 할 일을 바로 추가·체크 (구글 할 일과 동기화)
+- 날짜별 메모 (`~/.local/share/haru/memo/`)
+- **노션 일기에 올리기**: 그날의 할 일(체크 상태)·일정·git 커밋(`/data/project` 아래 레포)·메모를
+  노션 일기 데이터베이스에 `2026-10-15 (목)` 페이지로 올림. 같은 날 다시 올리면 덮어씀
 
 ## 실행
 
@@ -29,6 +33,15 @@ sudo apt install gir1.2-adw-1 gir1.2-ecal-2.0 gir1.2-edataserver-1.2 gir1.2-ical
 
 앱 메뉴에 등록하려면 `io.github.yunho09.Haru.desktop`을 `~/.local/share/applications/`에 복사한다
 (`Exec` 경로를 클론한 위치로 바꿀 것).
+
+## 노션 연결
+
+1. <https://www.notion.so/profile/integrations> 에서 내부 통합을 만들고 토큰 복사
+2. 일기 데이터베이스 `⋯` → 연결 → 그 통합 추가
+3. 앱에서 "노션 일기에 올리기"를 누르면 뜨는 창에 토큰 붙여넣기
+
+설정은 `~/.config/haru/notion.json` (권한 600)에 저장된다. 데이터베이스나 레포 위치를 바꾸려면
+이 파일의 `database_id`, `project_root` 를 고친다.
 
 ## 단축키
 
