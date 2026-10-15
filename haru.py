@@ -1044,16 +1044,6 @@ class WeekView(Gtk.Box):
         ws = self.week_start
         return [ws + timedelta(days=i) for i in range(7)]
 
-    def events(self):
-        """미리보기(끄는 중인 일정)를 반영한 이번 주 일정."""
-        evs = getattr(self.win, "events", [])
-        d = self._drag
-        if d and d.get("active") and d.get("event") is not None and d.get("new"):
-            ev = d["event"]
-            evs = [replace(x, start=d["new"][0], end=d["new"][1])
-                   if (x.source_uid, x.uid, x.rid) == (ev.source_uid, ev.uid, ev.rid) else x for x in evs]
-        return evs
-
     def update(self):
         """하루 종일 줄 수에 맞춰 머리 높이를 정하고 다시 그린다."""
         days = self.days()
@@ -1184,7 +1174,7 @@ class WeekView(Gtk.Box):
             d0 = datetime.combine(d, time())
             d1 = d0 + timedelta(days=1)
             segs = []
-            for e in self.events():
+            for e in getattr(self.win, "events", []):
                 if e.all_day:
                     continue
                 s, en = max(e.start, d0), min(max(e.end, e.start + timedelta(minutes=15)), d1)
@@ -1196,18 +1186,22 @@ class WeekView(Gtk.Box):
                 y = (s - d0).total_seconds() / 3600 * self.HOUR + 1
                 h = max((en - s).total_seconds() / 3600 * self.HOUR - 2, 18)
                 c = rgba(self.win.store.colors.get(e.source_uid, "#62a0ea"))
-                live = dragging is not None and e.uid == dragging.uid and e.rid == dragging.rid
-                set_src(cr, c, 0.45 if live else 0.25)
+                ghost = dragging is not None and (e.source_uid, e.uid, e.rid) == \
+                    (dragging.source_uid, dragging.uid, dragging.rid)
+                if ghost:  # 끄는 중인 일정의 원래 자리: 점선 테두리만
+                    set_src(cr, fg, 0.45)
+                    cr.set_line_width(1.2)
+                    cr.set_dash([4, 3])
+                    round_rect(cr, x + 0.6, y + 0.6, w - 1.2, h - 1.2, 5)
+                    cr.stroke()
+                    cr.set_dash([])
+                    continue
+                set_src(cr, c, 0.25)
                 round_rect(cr, x, y, w, h, 5)
                 cr.fill()
                 set_src(cr, c)
                 cr.rectangle(x, y, 3, h)
                 cr.fill()
-                if live:
-                    set_src(cr, accent)
-                    cr.set_line_width(1.5)
-                    round_rect(cr, x + 0.75, y + 0.75, w - 1.5, h - 1.5, 5)
-                    cr.stroke()
                 lines = max(int((h - 4) // 14), 1)
                 used = text(cr, self, e.summary, x + 7, y + 2, w - 9, size=8.5, bold=True, color=fg,
                             lines=min(lines, 2))
@@ -1216,8 +1210,39 @@ class WeekView(Gtk.Box):
                          color=rgba(fg.to_string(), 0.7))
                 self._rects.append((x, y, w, h, e))
 
-        # 새 일정 범위
+        # 끄는 중인 일정: 맨 위에 진한 색 + 흰 글씨로 바뀐 시각
         d = self._drag
+        if dragging is not None and d.get("new"):
+            ns, ne = d["new"]
+            c = rgba(self.win.store.colors.get(dragging.source_uid, "#62a0ea"))
+            white = rgba("white")
+            for i, day in enumerate(days):
+                d0 = datetime.combine(day, time())
+                s0, e0 = max(ns, d0), min(ne, d0 + timedelta(days=1))
+                if e0 <= s0:
+                    continue
+                x = self.GUTTER + i * colw + 2
+                w = colw - 4
+                y = (s0 - d0).total_seconds() / 3600 * self.HOUR + 1
+                h = max((e0 - s0).total_seconds() / 3600 * self.HOUR - 2, 22)
+                cr.save()
+                set_src(cr, rgba("black"), 0.35)  # 그림자
+                round_rect(cr, x + 1, y + 3, w, h, 6)
+                cr.fill()
+                cr.restore()
+                set_src(cr, c, 0.95)
+                round_rect(cr, x, y, w, h, 6)
+                cr.fill()
+                set_src(cr, accent)
+                cr.set_line_width(2)
+                round_rect(cr, x + 1, y + 1, w - 2, h - 2, 5)
+                cr.stroke()
+                used = text(cr, self, f"{ns:%H:%M}–{ne:%H:%M}", x + 8, y + 3, w - 12, size=9.5, bold=True,
+                            color=white)
+                if h - used > 16:
+                    text(cr, self, dragging.summary, x + 8, y + 3 + used, w - 12, size=8.5, color=white)
+
+        # 새 일정 범위
         if d and d.get("active") and d.get("event") is None and d.get("new"):
             s, en = d["new"]
             i = days.index(s.date())
@@ -2238,8 +2263,8 @@ class Window(Adw.ApplicationWindow):
 BASE_CSS = """
 .month-cell { padding: 4px 0; margin: 0; border-radius: 10px; min-height: 64px; }
 .month-cell .day-num { margin-left: 4px; }
-.month-cell.drag-range { background-color: alpha(@accent_bg_color, .10); }
-.month-cell .chip.dragging { box-shadow: inset 0 1px alpha(@accent_bg_color, .9), inset 0 -1px alpha(@accent_bg_color, .9); font-weight: 700; }
+.month-cell.drag-range { background-color: alpha(@accent_bg_color, .20); }
+.month-cell .chip.dragging { background-color: @accent_bg_color; color: @accent_fg_color; border-left-color: transparent; font-weight: 700; }
 .month-cell.other-month { opacity: .45; }
 .month-cell.selected-day { background-color: alpha(@accent_bg_color, .14); box-shadow: inset 0 0 0 2px alpha(@accent_bg_color, .55); }
 .day-num { font-weight: 700; font-feature-settings: "tnum"; min-width: 24px; min-height: 24px; border-radius: 12px; padding: 0 2px; }
