@@ -52,6 +52,7 @@ sudo apt install gir1.2-adw-1 gir1.2-ecal-2.0 gir1.2-edataserver-1.2 gir1.2-ical
 | --- | --- |
 | Ctrl+N | 새 일정 (할 일 탭에서는 입력칸으로) |
 | Ctrl+T | 오늘로 |
+| Ctrl+Z | 되돌리기 (추가·수정·드래그·삭제·할 일 체크, 최근 30개) |
 | ← → / ↑ ↓ | 하루 / 일주일 이동 (달 경계 넘으면 자동으로 다음 달) |
 | Page Up / Page Down | 이전 / 다음 달 (주 보기에서는 주) |
 | 날짜 두 번 클릭 | 그 날짜에 새 일정 |

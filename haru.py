@@ -157,6 +157,7 @@ class Store:
         self._pending = None
         self._gen = 0
         self.on_error = lambda msg: print(msg, file=sys.stderr)
+        self.on_undoable = None
         for sig in ("source-added", "source-removed", "source-enabled", "source-disabled"):
             self.registry.connect(sig, lambda *_: self.reconnect())
         self.reconnect()
@@ -321,30 +322,62 @@ class Store:
         return out
 
     # ── 쓰기 (모두 비동기, 결과는 done(err|None)) ──
+    # 쓰기 직전 모습을 찍어 두었다가 on_undoable(알림 문구, 제목, 되돌릴 목록) 으로 알린다.
+    # 되돌릴 목록 = [(캘린더, uid, 바꾸기 전 iCal 컴포넌트들)] — 빈 목록이면 "원래 없던 것".
+    def snapshot(self, source_uid, uid):
+        client = self.clients.get(source_uid)
+        if client is None or not uid:
+            return []
+        try:
+            ok, comps = client.get_objects_for_uid_sync(uid, None)
+        except GLib.Error:
+            return []
+        return [c.get_icalcomponent().clone() for c in comps or []]
+
+    def _record(self, label, summary, entries):
+        if self.on_undoable:
+            self.on_undoable(label, summary, entries)
+
     def _client(self, source_uid, done):
         client = self.clients.get(source_uid)
         if client is None:
             done("캘린더에 다시 연결하는 중이에요. 잠시 후 다시 해주세요")
         return client
 
-    def create(self, source_uid, comp, done):
+    def create(self, source_uid, comp, done, label=None, record=True):
         if not (client := self._client(source_uid, done)):
             return
-        client.create_object(comp.get_icalcomponent(), ECal.OperationFlags.NONE, None, self._finish("create", done), None)
 
-    def modify(self, source_uid, comp, mod, done):
+        def recorded(out):
+            uid = out[-1] if isinstance(out, tuple) else out if isinstance(out, str) else None
+            if record:
+                self._record(label, text_of(comp.get_summary()), [(source_uid, uid or comp.get_uid(), [])])
+
+        client.create_object(comp.get_icalcomponent(), ECal.OperationFlags.NONE, None,
+                             self._finish("create", done, recorded), None)
+
+    def modify(self, source_uid, comp, mod, done, label=None, record=True):
         if not (client := self._client(source_uid, done)):
             return
-        client.modify_object(comp.get_icalcomponent(), mod, ECal.OperationFlags.NONE, None, self._finish("modify", done), None)
+        before = self.snapshot(source_uid, comp.get_uid()) if record else None
+        recorded = (lambda _out: self._record(label, text_of(comp.get_summary()),
+                                              [(source_uid, comp.get_uid(), before)])) if record else None
+        client.modify_object(comp.get_icalcomponent(), mod, ECal.OperationFlags.NONE, None,
+                             self._finish("modify", done, recorded), None)
 
-    def remove(self, source_uid, uid, rid, mod, done):
+    def remove(self, source_uid, uid, rid, mod, done, label=None, record=True):
         if not (client := self._client(source_uid, done)):
             return
-        client.remove_object(uid, rid or None, mod, ECal.OperationFlags.NONE, None, self._finish("remove", done), None)
+        before = self.snapshot(source_uid, uid) if record else None
+        summary = text_of(ECal.Component.new_from_icalcomponent(before[0].clone()).get_summary()) if before else ""
+        recorded = (lambda _out: self._record(label, summary, [(source_uid, uid, before)])) if record else None
+        client.remove_object(uid, rid or None, mod, ECal.OperationFlags.NONE, None,
+                             self._finish("remove", done, recorded), None)
 
-    def move(self, old_src, new_src, comp, done):
+    def move(self, old_src, new_src, comp, done, label=None):
         """다른 캘린더로 옮기기 = 새 캘린더에 만들고 원래 것을 지운다."""
         uid = comp.get_uid()
+        before = self.snapshot(old_src, uid)
         new = comp.clone()
         new.set_uid(str(uuid.uuid4()))
         # 원래 캘린더에 묶인 정보(초대 조직자/참석자, 서버 전용 X- 속성)는 가져가지 않는다
@@ -362,15 +395,75 @@ class Store:
             if err:
                 # 새 캘린더에는 이미 만들어졌으니 저장은 성공으로 처리 (다시 누르면 중복됨)
                 self.on_error(f"옮긴 뒤 원래 일정 삭제 실패: {err}")
+            else:
+                self._record(label, text_of(comp.get_summary()), [(new_src, new.get_uid(), []), (old_src, uid, before)])
             done(None)
 
         def after_create(err):
             if err:
                 done(err)
             else:
-                self.remove(old_src, uid, None, ECal.ObjModType.ALL, after_remove)
+                self.remove(old_src, uid, None, ECal.ObjModType.ALL, after_remove, record=False)
 
-        self.create(new_src, new, after_create)
+        self.create(new_src, new, after_create, record=False)
+
+    def restore(self, entries, done):
+        """찍어 둔 모습으로 되돌린다."""
+        def rid_of(ic):
+            return ECal.Component.new_from_icalcomponent(ic.clone()).get_recurid_as_string() or ""
+
+        steps = []
+        for src, uid, snap in entries:
+            client = self.clients.get(src)
+            if client is None:
+                done("캘린더에 다시 연결하는 중이에요. 잠시 후 다시 해주세요")
+                return
+            cur = {rid_of(i): i for i in self.snapshot(src, uid)}
+            old = {rid_of(i): i for i in snap}
+            if not old:  # 원래 없던 것 → 지운다
+                if cur:
+                    steps.append(("remove", client, uid, None, ECal.ObjModType.ALL))
+                continue
+            # 나중에 떼어낸 회차부터 지운다 (지우면 원본에 '제외'가 붙으니, 원본 복원은 그 다음에)
+            for rid in cur:
+                if rid and rid not in old:
+                    steps.append(("remove", client, uid, rid, ECal.ObjModType.THIS))
+            for rid in sorted(old):  # "" (원본) 먼저
+                comp = ECal.Component.new_from_icalcomponent(old[rid].clone())
+                mod = ECal.ObjModType.ALL if not rid else ECal.ObjModType.THIS
+                if rid in cur:
+                    # 서버가 옛 버전으로 보고 거절하지 않게 순번은 지금 것보다 올린다
+                    seq = ECal.Component.new_from_icalcomponent(cur[rid].clone()).get_sequence()
+                    comp.set_sequence(max(seq, comp.get_sequence()) + 1)
+                    steps.append(("modify", client, comp.get_icalcomponent(), None, mod))
+                elif not rid:
+                    steps.append(("create", client, comp.get_icalcomponent(), None, None))
+                else:  # 떼어냈던 회차 다시 떼어내기
+                    steps.append(("modify", client, comp.get_icalcomponent(), None, mod))
+
+        def run(i=0, err=None):
+            if err or i == len(steps):
+                self.changed()
+                done(err)
+                return
+            kind, client, a, b, mod = steps[i]
+            nxt = lambda e: run(i + 1, e)  # noqa: E731
+            flags = ECal.OperationFlags.NONE
+            if kind == "create":
+                def retry(e, a=a, client=client):
+                    if not e:
+                        return nxt(None)
+                    # 같은 uid 로 다시 못 만드는 서버(구글 등)면 새 uid 로
+                    ic = a.clone()
+                    ic.set_uid(str(uuid.uuid4()))
+                    client.create_object(ic, flags, None, self._finish("create", nxt), None)
+                client.create_object(a, flags, None, self._finish("create", retry), None)
+            elif kind == "modify":
+                client.modify_object(a, mod, flags, None, self._finish("modify", nxt), None)
+            else:
+                client.remove_object(a, b, mod, flags, None, self._finish("remove", nxt), None)
+
+        run()
 
     def master(self, source_uid, uid):
         client = self.clients.get(source_uid)
@@ -382,14 +475,17 @@ class Store:
             return None
         return ECal.Component.new_from_icalcomponent(icomp)
 
-    def _finish(self, op, done):
+    def _finish(self, op, done, on_success=None):
         def cb(client, res, _data):
+            out = None
             try:
-                getattr(client, f"{op}_object_finish")(res)
+                out = getattr(client, f"{op}_object_finish")(res)
                 err = None
             except GLib.Error as e:
                 err = e.message
             self.changed()
+            if err is None and on_success is not None:
+                on_success(out)
             done(err)
 
         return cb
@@ -860,7 +956,8 @@ class EventDialog(Adw.Dialog):
                     self.win.toast(f"삭제 실패: {err}")
                 else:
                     self.close()
-            self.store.remove(ev.source_uid, ev.uid, ev.rid if mod == ECal.ObjModType.THIS else None, mod, done)
+            self.store.remove(ev.source_uid, ev.uid, ev.rid if mod == ECal.ObjModType.THIS else None, mod, done,
+                              label="삭제했어요")
 
         if ev.recurring:
             self._ask_scope("이 반복 일정을 어떻게 삭제할까요?", "삭제", run, None, destructive=True)
@@ -1546,6 +1643,12 @@ class Window(Adw.ApplicationWindow):
         self.add_controller(keys)
         self.store = Store(self.refresh)
         self.store.on_error = self.toast
+        self.store.on_undoable = self._push_undo
+        self._undo = []  # [(제목, 되돌릴 목록)]
+        self._undo_toast = None
+        undo_keys = Gtk.EventControllerKey()  # 버블 단계: 입력칸이 자기 Ctrl+Z 를 먼저 쓴다
+        undo_keys.connect("key-pressed", self._on_undo_key)
+        self.add_controller(undo_keys)
         # 자정이 지나면 '오늘' 표시를 갱신
         GLib.timeout_add_seconds(60, self._tick)
         self._today = date.today()
@@ -1728,6 +1831,42 @@ class Window(Adw.ApplicationWindow):
             app.set_accels_for_action(f"win.{name}", accels)
 
     # ── 동작 ──
+    # ── 되돌리기 ──
+    def _push_undo(self, label, summary, entries):
+        self._undo.append((summary, entries))
+        del self._undo[:-30]
+        if label:  # 실수하기 쉬운 동작은 바로 되돌릴 수 있게 알림에 버튼
+            if self._undo_toast is not None:
+                self._undo_toast.dismiss()
+            t = Adw.Toast(title=f"‘{summary}’ {label}" if summary else label, button_label="되돌리기", timeout=6)
+            t.connect("button-clicked", lambda *_: self.undo())
+            t.connect("dismissed", lambda t: setattr(self, "_undo_toast", None) if self._undo_toast is t else None)
+            self._undo_toast = t
+            self.toasts.add_toast(t)
+
+    def _on_undo_key(self, _c, keyval, _code, state):
+        if keyval in (Gdk.KEY_z, Gdk.KEY_Z) and state & Gdk.ModifierType.CONTROL_MASK \
+                and not state & Gdk.ModifierType.SHIFT_MASK and self.get_visible_dialog() is None:
+            self.undo()
+            return True
+        return False
+
+    def undo(self):
+        if self._undo_toast is not None:
+            self._undo_toast.dismiss()
+        if not self._undo:
+            self.toast("되돌릴 게 없어요")
+            return
+        summary, entries = self._undo.pop()
+
+        def done(err):
+            if err:
+                self.toast(f"되돌리기 실패: {err}")
+            else:
+                self.toast(f"‘{summary}’ 되돌렸어요" if summary else "되돌렸어요")
+
+        self.store.restore(entries, done)
+
     def toast(self, msg):
         self.toasts.add_toast(Adw.Toast(title=msg, timeout=4))
 
@@ -2009,10 +2148,9 @@ class Window(Adw.ApplicationWindow):
             if err:
                 self.toast(f"변경 실패: {err}")
                 self.refresh()  # 원래 길이로 되돌린다
-            elif ev.recurring:
-                self.toast("반복 일정은 이 회차만 바꿨어요")
 
-        self.store.modify(ev.source_uid, comp, mod, done)
+        self.store.modify(ev.source_uid, comp, mod, done,
+                          label="이 회차만 바꿨어요" if ev.recurring else "바꿨어요")
 
     def _day_row_activated(self, _l, row):
         if getattr(row, "event", None):
@@ -2067,7 +2205,7 @@ class Window(Adw.ApplicationWindow):
                 self.toast(f"삭제 실패: {err}")
             elif after:
                 after()
-        self.store.remove(task.source_uid, task.uid, None, ECal.ObjModType.ALL, done)
+        self.store.remove(task.source_uid, task.uid, None, ECal.ObjModType.ALL, done, label="삭제했어요")
 
     def _task_row(self, task):
         row = Adw.ActionRow(title=GLib.markup_escape_text(task.summary), activatable=True)
