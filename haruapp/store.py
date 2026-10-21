@@ -363,17 +363,11 @@ class Store:
                 if rid and rid not in old:
                     steps.append(("remove", client, uid, rid, ECal.ObjModType.THIS))
             for rid in sorted(old):  # "" (원본) 먼저
-                comp = ECal.Component.new_from_icalcomponent(old[rid].clone())
-                mod = ECal.ObjModType.ALL if not rid else ECal.ObjModType.THIS
-                if rid in cur:
-                    # 서버가 옛 버전으로 보고 거절하지 않게 순번은 지금 것보다 올린다
-                    seq = ECal.Component.new_from_icalcomponent(cur[rid].clone()).get_sequence()
-                    comp.set_sequence(max(seq, comp.get_sequence()) + 1)
-                    steps.append(("modify", client, comp.get_icalcomponent(), None, mod))
-                elif not rid:
-                    steps.append(("create", client, comp.get_icalcomponent(), None, None))
-                else:  # 떼어냈던 회차 다시 떼어내기
-                    steps.append(("modify", client, comp.get_icalcomponent(), None, mod))
+                ic = old[rid].clone()
+                if not rid and rid not in cur:
+                    steps.append(("create", client, ic, None, None))
+                else:  # 고치기 또는 떼어냈던 회차 다시 떼어내기 — 버전은 실행 직전에 맞춘다
+                    steps.append(("modify", client, ic, rid, ECal.ObjModType.ALL if not rid else ECal.ObjModType.THIS))
 
         steps += late
         remap = {}  # 새 uid 로 다시 만든 원본 → 뒤따르는 회차 단계도 새 uid 로
@@ -402,7 +396,8 @@ class Store:
                     client.create_object(ic, flags, None, self._finish("create", nxt), None)
                 client.create_object(a, flags, None, self._finish("create", retry), None)
             elif kind == "modify":
-                client.modify_object(a, mod, flags, None, self._finish("modify", nxt), None)
+                # 앞 단계가 서버 버전을 바꿨을 수 있다 (구글은 옛 ETag 로 고치면 409)
+                client.modify_object(_current_version(client, a, b), mod, flags, None, self._finish("modify", nxt), None)
             else:
                 client.remove_object(a, b, mod, flags, None, self._finish("remove", nxt), None)
 
@@ -425,6 +420,28 @@ class Store:
                                  self._finish("remove", lambda e: step(i + 1, e)), None)
 
         step()
+
+    def turn_off_repeat(self, source_uid, comp, done, label=None):
+        """반복 일정을 하나짜리로: 떼어낸 회차를 먼저 지우고 원본을 바꾼다.
+        구글은 떼어낸 회차가 남아 있으면 반복 규칙을 못 지우게 한다(400). 되돌리기는 지우기 전 모습으로."""
+        uid = comp.get_uid()
+        before = self.snapshot(source_uid, uid)
+
+        def removed(err):
+            if err:
+                done(err)
+                return
+            # 회차를 지우면 서버 쪽 원본 버전(ETag)이 바뀐다 → 지금 것으로 맞춰야 저장된다
+            fresh = ECal.Component.new_from_icalcomponent(_current_version(self.clients[source_uid],
+                                                                           comp.get_icalcomponent(), ""))
+            self.modify(source_uid, fresh, ECal.ObjModType.ALL, saved, record=False)
+
+        def saved(err):
+            if err is None:
+                self._record(label, text_of(comp.get_summary()), [(source_uid, uid, before)])
+            done(err)
+
+        self.remove_detached(source_uid, uid, removed)
 
     def master(self, source_uid, uid):
         client = self.clients.get(source_uid)
@@ -453,3 +470,31 @@ class Store:
             done(err)
 
         return cb
+
+
+def _x_props(icomp):
+    props, p = [], icomp.get_first_property(ICalGLib.PropertyKind.X_PROPERTY)
+    while p is not None:
+        props.append(p)
+        p = icomp.get_next_property(ICalGLib.PropertyKind.X_PROPERTY)
+    return props
+
+
+def _current_version(client, icomp, rid):
+    """icomp 사본에 서버의 지금 버전 정보(X- 속성: CalDAV ETag 등)와 더 높은 순번을 입힌다.
+    회차(rid)가 없으면 원본 것을 쓴다. 서버에 아직 없으면 그대로."""
+    ic = icomp.clone()
+    try:
+        ok, cur = client.get_object_sync(ic.get_uid(), rid or None, None)
+    except GLib.Error:
+        try:
+            ok, cur = client.get_object_sync(ic.get_uid(), None, None)
+        except GLib.Error:
+            return ic
+    for prop in _x_props(ic):
+        ic.remove_property(prop)
+    for prop in _x_props(cur):
+        ic.add_property(prop.clone())
+    comp = ECal.Component.new_from_icalcomponent(ic)
+    comp.set_sequence(max(comp.get_sequence(), ECal.Component.new_from_icalcomponent(cur.clone()).get_sequence()) + 1)
+    return comp.get_icalcomponent()

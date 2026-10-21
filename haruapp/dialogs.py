@@ -285,8 +285,7 @@ class EventDialog(Adw.Dialog):
             if rule_changed:
                 if r_idx == 0:  # 반복을 끄면 지금 연 회차 자리에 일정 하나만 남긴다
                     # 따로 떼어냈던 회차들도 지운다 — 안 그러면 다른 앱(폰·상단바)에 떨어진 일정으로 남는다
-                    after = lambda err: done(err) if err else self.store.remove_detached(src, ev.uid, done)  # noqa: E731
-                    self.store.modify(src, fill(master, s, e, ""), mod, after)
+                    self.store.turn_off_repeat(src, fill(master, s, e, ""), done)
                     return
                 # 규칙을 새로 만들면 요일·날짜도 새 시작일 기준이라 날짜 이동도 가능
                 m_day = as_date(ical_to_py(master.get_dtstart().get_value())) + shift
