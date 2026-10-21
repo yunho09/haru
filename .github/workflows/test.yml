@@ -1,0 +1,17 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: 의존성 (PyGObject + EDS·libical 타입 정보)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-gi gir1.2-ecal-2.0 gir1.2-edataserver-1.2 gir1.2-ical-3.0 git
+      - name: 단위 테스트 (실제 캘린더가 필요한 tests/test_store_eds.py 는 건너뜀)
+        run: /usr/bin/python3 -m unittest discover -s tests -t . -v

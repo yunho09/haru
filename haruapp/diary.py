@@ -182,29 +182,35 @@ def _call(token, method, path, body=None, tries=4):
         with urllib.request.urlopen(req, timeout=20) as res:
             return json.loads(res.read() or b"{}")
     except urllib.error.HTTPError as e:
-        if e.code in (429, 502, 503) and tries > 1:  # 요청 제한·일시 오류는 잠깐 쉬고 다시
-            try:
-                wait = float(e.headers.get("Retry-After") or 1)
-            except ValueError:
-                wait = 1
-            time.sleep(min(wait, 10))
-            return _call(token, method, path, body, tries - 1)
-        try:
-            info = json.loads(e.read())
-        except ValueError:
-            info = {}
-        code = info.get("code", "")
-        if code == "unauthorized":
-            raise NotionError("노션 토큰이 올바르지 않아요") from None
-        if code == "object_not_found":
-            raise NotionError("일기 데이터베이스를 찾을 수 없어요. 데이터베이스에 통합을 연결했는지 확인해 주세요") from None
-        raise NotionError(info.get("message") or f"HTTP {e.code}") from None
+        with e:  # 오류 응답도 연결을 닫는다
+            return _http_error(e, token, method, path, body, tries)
     except urllib.error.URLError as e:
         raise NotionError(f"인터넷 연결을 확인해 주세요 ({e.reason})") from None
     except (OSError, http.client.HTTPException) as e:  # 읽다가 끊김·시간 초과
         raise NotionError(f"노션과 통신하다 끊겼어요 ({e})") from None
     except ValueError:
         raise NotionError("노션 응답을 읽지 못했어요") from None
+
+
+def _http_error(e, token, method, path, body, tries):
+    """HTTP 오류 응답 → 재시도하거나 알아듣기 쉬운 NotionError."""
+    if e.code in (429, 502, 503) and tries > 1:  # 요청 제한·일시 오류는 잠깐 쉬고 다시
+        try:
+            wait = float(e.headers.get("Retry-After") or 1)
+        except ValueError:
+            wait = 1
+        time.sleep(min(wait, 10))
+        return _call(token, method, path, body, tries - 1)
+    try:
+        info = json.loads(e.read())
+    except ValueError:
+        info = {}
+    code = info.get("code", "")
+    if code == "unauthorized":
+        raise NotionError("노션 토큰이 올바르지 않아요") from None
+    if code == "object_not_found":
+        raise NotionError("일기 데이터베이스를 찾을 수 없어요. 데이터베이스에 통합을 연결했는지 확인해 주세요") from None
+    raise NotionError(info.get("message") or f"HTTP {e.code}") from None
 
 
 def check(cfg):

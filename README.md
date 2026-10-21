@@ -40,6 +40,40 @@ sudo apt install gir1.2-adw-1 gir1.2-ecal-2.0 gir1.2-edataserver-1.2 gir1.2-ical
 앱 메뉴에 등록하려면 `io.github.yunho09.Haru.desktop`을 `~/.local/share/applications/`에 복사한다
 (`Exec` 경로를 클론한 위치로 바꿀 것).
 
+libadwaita 1.7 이상(GNOME 48+)이 필요하다 (월/주 전환 토글).
+
+## 구조
+
+| 파일 | 내용 |
+| --- | --- |
+| `haru.py` | 실행 파일 (`--diary`: 오늘 메모칸으로, `--remind`: 밤 일기 알림) |
+| `haruapp/core.py` | 날짜·시간 변환, 일정·할 일 데이터, 반복 규칙, 드래그·겹침 계산 — GTK 없이 테스트 가능 |
+| `haruapp/store.py` | Evolution Data Server 연결·조회·쓰기·되돌리기, 연결 지연 감지·서비스 재시작 |
+| `haruapp/window.py` | 메인 창: 월 보기, 사이드바(일정·할 일·메모), 할 일 탭, 드래그, 되돌리기 |
+| `haruapp/weekview.py` | 주 보기 (cairo 로 직접 그리는 시간표) |
+| `haruapp/dialogs.py`, `widgets.py` | 일정·할 일·노션 연결 창, 날짜·시간 입력 |
+| `haruapp/diary.py` | 노션 일기 올리기, 메모·업로드 기록 파일 |
+| `haruapp/app.py`, `log.py` | 앱 시작·명령줄·알림, 오류 로그 |
+
+## 테스트
+
+```sh
+/usr/bin/python3 -m unittest discover -s tests -t .          # 핵심 로직 + 노션(가짜 서버)
+HARU_EDS_TESTS=1 /usr/bin/python3 -m unittest tests.test_store_eds   # 실제 로컬 캘린더로 쓰기·되돌리기
+```
+
+마지막 것은 데스크톱 세션의 로컬 '개인' 캘린더에 `haru-test-` 일정을 만들었다 지운다 (구글 캘린더는 안 건드림).
+GitHub Actions 는 앞의 것만 돌린다.
+
+## 캘린더가 안 뜰 때
+
+구글 일정이 안 보이고 위쪽에 "연결이 늦어요" 띠가 뜨면, GNOME 캘린더 서비스(evolution-source-registry)가
+멈춘 것이다. 띠의 "다시 연결"을 누르면 서비스를 다시 띄운다. 수동으로는:
+
+```sh
+systemctl --user restart evolution-source-registry evolution-calendar-factory
+```
+
 ## 노션 연결
 
 1. <https://www.notion.so/profile/integrations> 에서 내부 통합을 만들고 토큰 복사
