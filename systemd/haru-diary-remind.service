@@ -1,0 +1,8 @@
+[Unit]
+Description=하루: 오늘 일기를 아직 안 올렸으면 알림
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /data/project/haru/haru.py --remind
+# 알림을 누르거나 닫을 때까지 기다리므로, 오래 방치되면 끝낸다
+RuntimeMaxSec=3h

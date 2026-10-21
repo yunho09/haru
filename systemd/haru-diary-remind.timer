@@ -1,0 +1,8 @@
+[Unit]
+Description=하루: 밤 10시 일기 알림
+
+[Timer]
+OnCalendar=*-*-* 22:00:00
+
+[Install]
+WantedBy=timers.target

@@ -5,10 +5,14 @@
 등록한 구글 캘린더/할 일과 자동으로 동기화되고, 알림은 evolution-alarm-notify
 데몬이 앱이 꺼져 있어도 띄워준다.
 """
+import os
+import subprocess
 import sys
+import traceback
 import uuid
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
+from pathlib import Path
 
 import threading
 
@@ -25,6 +29,44 @@ from gi.repository import (Adw, ECal, EDataServer, Gdk, Gio, GLib, GObject, Grap
                            ICalGLib, Pango, PangoCairo)
 
 import diary  # noqa: E402
+
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "haru"
+
+
+def log(*parts):
+    print(f"[{datetime.now():%m-%d %H:%M:%S}]", *parts, file=sys.stderr)
+
+
+def setup_log():
+    """오류를 ~/.local/state/haru/haru.log 에 남긴다. 앱 메뉴로 켰을 때는 GTK 경고까지."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    path = STATE_DIR / "haru.log"
+    if path.exists() and path.stat().st_size > 1_000_000:
+        path.replace(path.with_suffix(".log.1"))
+    f = open(path, "a", buffering=1, encoding="utf-8")
+    f.write(f"\n=== {datetime.now():%Y-%m-%d %H:%M:%S} 시작 (pid {os.getpid()}) ===\n")
+    if sys.stderr is None or not sys.stderr.isatty():
+        os.dup2(f.fileno(), 2)  # C 쪽(GTK·GLib) 경고도 같은 파일로
+        sys.stderr = f
+    else:  # 터미널에서 켰으면 화면과 파일 둘 다
+        term = sys.stderr
+
+        class Tee:
+            def write(self, data):
+                term.write(data)
+                f.write(data)
+
+            def flush(self):
+                term.flush()
+                f.flush()
+
+        sys.stderr = Tee()
+
+    def hook(kind, value, tb):  # 콜백 안에서 난 처리 안 된 오류도 여기로 온다
+        log("처리 안 된 오류")
+        traceback.print_exception(kind, value, tb, file=sys.stderr)
+
+    sys.excepthook = hook
 
 APP_ID = "io.github.yunho09.Haru"
 WEEKDAYS = ["월", "화", "수", "목", "금", "토", "일"]
@@ -156,8 +198,9 @@ class Store:
         self.colors = {}
         self._pending = None
         self._gen = 0
-        self.on_error = lambda msg: print(msg, file=sys.stderr)
+        self.on_error = log
         self.on_undoable = None
+        self.busy = 0  # 진행 중인 쓰기 수
         for sig in ("source-added", "source-removed", "source-enabled", "source-disabled"):
             self.registry.connect(sig, lambda *_: self.reconnect())
         self.reconnect()
@@ -190,7 +233,7 @@ class Store:
         try:
             client = ECal.Client.connect_finish(res)
         except GLib.Error as e:
-            print("연결 실패:", e.message, file=sys.stderr)
+            log("연결 실패:", e.message)
             return
         uid = client.get_source().get_uid()
         src = self.source(uid)
@@ -284,7 +327,7 @@ class Store:
             try:
                 ok, comps = client.get_object_list_as_comps_sync(sexp, None)
             except GLib.Error as e:
-                print("일정 읽기 실패:", e.message, file=sys.stderr)
+                log("일정 읽기 실패:", e.message)
                 continue
             # 반복 일정에서 떼어낸 회차는 원본을 펼칠 때 같이 나온다.
             # (generate_instances_sync 는 떼어낸 회차를 무시해서 쓰지 않는다)
@@ -295,7 +338,7 @@ class Store:
                 try:
                     client.generate_instances_for_object_sync(comp.get_icalcomponent(), t0, t1, None, cb)
                 except GLib.Error as e:
-                    print("일정 펼치기 실패:", e.message, file=sys.stderr)
+                    log("일정 펼치기 실패:", e.message)
         out.sort(key=lambda ev: (as_date(ev.start), 0 if ev.all_day else 1, time() if ev.all_day else ev.start.time(), ev.summary))
         return out
 
@@ -412,7 +455,7 @@ class Store:
         def rid_of(ic):
             return ECal.Component.new_from_icalcomponent(ic.clone()).get_recurid_as_string() or ""
 
-        steps = []
+        steps, late = [], []
         for src, uid, snap in entries:
             client = self.clients.get(src)
             if client is None:
@@ -420,9 +463,9 @@ class Store:
                 return
             cur = {rid_of(i): i for i in self.snapshot(src, uid)}
             old = {rid_of(i): i for i in snap}
-            if not old:  # 원래 없던 것 → 지운다
+            if not old:  # 원래 없던 것 → 지운다. 단 되살리기가 다 끝난 뒤에 (옮기기 되돌리다 둘 다 잃지 않게)
                 if cur:
-                    steps.append(("remove", client, uid, None, ECal.ObjModType.ALL))
+                    late.append(("remove", client, uid, None, ECal.ObjModType.ALL))
                 continue
             # 나중에 떼어낸 회차부터 지운다 (지우면 원본에 '제외'가 붙으니, 원본 복원은 그 다음에)
             for rid in cur:
@@ -441,6 +484,9 @@ class Store:
                 else:  # 떼어냈던 회차 다시 떼어내기
                     steps.append(("modify", client, comp.get_icalcomponent(), None, mod))
 
+        steps += late
+        remap = {}  # 새 uid 로 다시 만든 원본 → 뒤따르는 회차 단계도 새 uid 로
+
         def run(i=0, err=None):
             if err or i == len(steps):
                 self.changed()
@@ -449,6 +495,11 @@ class Store:
             kind, client, a, b, mod = steps[i]
             nxt = lambda e: run(i + 1, e)  # noqa: E731
             flags = ECal.OperationFlags.NONE
+            if kind == "remove":
+                a = remap.get(a, a)
+            elif a.get_uid() in remap:
+                a = a.clone()
+                a.set_uid(remap[a.get_uid()])
             if kind == "create":
                 def retry(e, a=a, client=client):
                     if not e:
@@ -456,6 +507,7 @@ class Store:
                     # 같은 uid 로 다시 못 만드는 서버(구글 등)면 새 uid 로
                     ic = a.clone()
                     ic.set_uid(str(uuid.uuid4()))
+                    remap[a.get_uid()] = ic.get_uid()
                     client.create_object(ic, flags, None, self._finish("create", nxt), None)
                 client.create_object(a, flags, None, self._finish("create", retry), None)
             elif kind == "modify":
@@ -476,7 +528,10 @@ class Store:
         return ECal.Component.new_from_icalcomponent(icomp)
 
     def _finish(self, op, done, on_success=None):
+        self.busy += 1  # 비동기 호출 바로 전에 만들어진다
+
         def cb(client, res, _data):
+            self.busy = max(self.busy - 1, 0)
             out = None
             try:
                 out = getattr(client, f"{op}_object_finish")(res)
@@ -517,7 +572,11 @@ class DateButton(Gtk.MenuButton):
     def set_date(self, d):
         self.value = d
         self.set_label(fmt_day(d))
-        self.cal.select_day(GLib.DateTime.new_local(d.year, d.month, d.day, 0, 0, 0))
+        dt = GLib.DateTime.new_local(d.year, d.month, d.day, 0, 0, 0)
+        if hasattr(self.cal, "set_date"):  # GTK 4.20+
+            self.cal.set_date(dt)
+        else:
+            self.cal.select_day(dt)
 
     def _on_nav(self, *_):
         self._navigated = True
@@ -584,8 +643,9 @@ def parse_rule(text):
     return out
 
 
-def repeat_index(r):
-    """반복 규칙 → REPEATS 인덱스. 앱에서 표현 못 하는 규칙이면 None(사용자 지정)."""
+def repeat_index(r, start=None):
+    """반복 규칙 → REPEATS 인덱스. 앱에서 표현 못 하는 규칙이면 None(사용자 지정).
+    start(시리즈 첫날)와 어긋나는 요일·날짜 지정도 표현 못 하는 것으로 본다 — 프리셋으로 바꾸면 규칙이 달라지니까."""
     if not r:
         return 0
     if set(r) - {"FREQ", "INTERVAL", "BYDAY", "UNTIL", "BYMONTHDAY", "BYMONTH", "WKST"}:
@@ -594,6 +654,16 @@ def repeat_index(r):
     days = byday.split(",") if byday else []
     if any(not d.isalpha() for d in days):
         return None  # 매월 둘째 화요일(2TU) 같은 것
+    if start is None:
+        if "BYMONTHDAY" in r or "BYMONTH" in r:
+            return None
+    else:
+        if r.get("BYMONTHDAY", str(start.day)) != str(start.day):
+            return None  # 매월 마지막 날(-1), 1일·15일 등
+        if r.get("BYMONTH", str(start.month)) != str(start.month):
+            return None
+        if freq == "WEEKLY" and len(days) == 1 and days[0] != WEEKDAY_CODES[start.weekday()]:
+            return None
     if freq == "DAILY" and interval == 1 and not days:
         return 1
     if freq == "WEEKLY" and interval == 1 and sorted(days) == sorted(WEEKDAY_CODES[:5]):
@@ -727,12 +797,15 @@ class EventDialog(Adw.Dialog):
         self.all_day.connect("notify::active", lambda *_: self._all_day_toggled())
 
         # 반복: 반복 일정이면 원본(첫 회차)의 규칙을 읽는다
-        rule = {}
+        rule, series_start = {}, sd
         if event is not None and event.recurring:
             master = self.store.master(event.source_uid, event.uid)
             rrules = master.get_rrules() if master else None
             rule = parse_rule(rrules[0].to_string()) if rrules else {"X-UNKNOWN": "1"}
-        idx = repeat_index(rule)
+            if master is not None:
+                series_start = as_date(ical_to_py(master.get_dtstart().get_value()))
+        idx = repeat_index(rule, series_start)
+        self._all_day0 = all_day
         labels = REPEATS + ([CUSTOM_REPEAT] if idx is None else [])
         self._custom_repeat = len(REPEATS) if idx is None else -1
         self._repeat0 = len(REPEATS) if idx is None else idx
@@ -823,6 +896,8 @@ class EventDialog(Adw.Dialog):
     def _start_date_changed(self, d):
         # 기간은 유지한 채 종료 날짜도 같이 옮긴다
         self.end_date.set_date(self.end_date.value + (d - self._start_prev))
+        if not self.repeat_end.get_active():  # 아직 안 고른 반복 종료일 기본값도 따라간다
+            self.until.set_date(self.until.value + (d - self._start_prev))
         self._start_prev = d
 
     def _start_time_changed(self, t):
@@ -858,6 +933,11 @@ class EventDialog(Adw.Dialog):
 
         r_idx, r_until = self._repeat_choice()
         rule_changed = (self._custom_repeat if r_idx is None else r_idx, r_until) != (self._repeat0, self._until0)
+        if r_idx is not None and self._until0 and self.all_day.get_active() != self._all_day0:
+            rule_changed = True  # UNTIL 형식(날짜/시각)이 DTSTART 와 같아야 해서 규칙을 다시 만든다
+        if r_idx and r_until is not None and r_until < as_date(s):
+            self.win.toast("반복 종료일이 시작일보다 빨라요")
+            return
 
         def fill(comp, cs, ce, rule=KEEP):
             if rule is not KEEP:
@@ -925,11 +1005,13 @@ class EventDialog(Adw.Dialog):
                 return
             shift = as_date(s) - as_date(ev.start)
             if rule_changed:
-                # 규칙을 새로 만들면 요일·날짜도 새 시작일 기준으로 다시 정해지니 날짜 이동도 가능
-                m_day = as_date(ical_to_py(master.get_dtstart().get_value())) + shift
-                ms = m_day if not isinstance(s, datetime) else datetime.combine(m_day, s.time())
-                rule = build_rule(r_idx, ms, r_until)
-                self.store.modify(src, fill(master, ms, ms + (e - s), rule), mod, done)
+                if r_idx == 0:  # 반복을 끄면 지금 연 회차 자리에 일정 하나만 남긴다
+                    ms, me = s, e
+                else:  # 규칙을 새로 만들면 요일·날짜도 새 시작일 기준이라 날짜 이동도 가능
+                    m_day = as_date(ical_to_py(master.get_dtstart().get_value())) + shift
+                    ms = m_day if not isinstance(s, datetime) else datetime.combine(m_day, s.time())
+                    me = ms + (e - s)
+                self.store.modify(src, fill(master, ms, me, build_rule(r_idx, ms, r_until)), mod, done)
                 return
             if shift.days != 0:
                 # 반복 규칙(예: 매주 월요일)은 그대로라 날짜만 옮기면 일정이 깨진다
@@ -1174,21 +1256,25 @@ class WeekView(Gtk.Box):
     def _colw(self, width):
         return (width - self.GUTTER) / 7
 
-    def _at(self, x, y):
-        """본문 좌표 → (날짜, 그날 0시부터 분) — 분은 SNAP 단위로 맞춤."""
+    def _at(self, x, y, end=False):
+        """본문 좌표 → (날짜, 그날 0시부터 분) — 분은 SNAP 단위로 맞춤.
+        end=False 면 23:45 까지만 (24:00 은 다음 날 0시라 클릭·시작점으로 쓰면 다음 날이 된다)."""
         colw = self._colw(self.body.get_width())
         i = min(max(int((x - self.GUTTER) // colw), 0), 6)
         minutes = min(max(y / self.HOUR * 60, 0), 24 * 60)
         minutes = int(round(minutes / self.SNAP) * self.SNAP)
+        if not end:
+            minutes = min(minutes, 24 * 60 - self.SNAP)
         return self.days()[i], minutes
 
     def _dt(self, day, minutes):
         return datetime.combine(day, time()) + timedelta(minutes=minutes)
 
     def _hit(self, x, y):
-        for rx, ry, rw, rh, ev in reversed(self._rects):
+        for rx, ry, rw, rh, ev, ends in reversed(self._rects):
             if rx <= x <= rx + rw and ry <= y <= ry + rh:
-                return ev, (y > ry + rh - 7)  # 아래 끝 7px 는 길이 조절
+                # 아래 끝 7px 는 길이 조절 — 단 일정이 실제로 끝나는 조각에서만 (여러 날 일정의 자정 끝 제외)
+                return ev, ends and (y > ry + rh - 7)
         return None, False
 
     def _scroll_to_morning(self):
@@ -1305,7 +1391,7 @@ class WeekView(Gtk.Box):
                 if h - used > 18:
                     text(cr, self, f"{e.start:%H:%M}–{e.end:%H:%M}", x + 7, y + 2 + used, w - 9, size=8,
                          color=rgba(fg.to_string(), 0.7))
-                self._rects.append((x, y, w, h, e))
+                self._rects.append((x, y, w, h, e, e.end <= d1))
 
         # 끄는 중인 블록: 마우스를 그대로 따라오고(시각 글자만 15분 단위), 놓으면 제자리로 미끄러진다
         d = self._drag
@@ -1434,7 +1520,7 @@ class WeekView(Gtk.Box):
                       "anchor": self._dt(day, minutes)}
         if ev is not None:
             self._drag["grab"] = self._dt(day, minutes) - ev.start  # 잡은 곳과 시작의 차이
-            for rx, ry, rw, rh, e in self._rects:  # 블록 안에서 잡은 위치(px)
+            for rx, ry, rw, rh, e, _ends in self._rects:  # 블록 안에서 잡은 위치(px)
                 if e is ev and rx <= x <= rx + rw and ry <= y <= ry + rh:
                     self._drag["grab_px"], self._drag["grab_py"] = x - rx, y - ry
 
@@ -1448,7 +1534,7 @@ class WeekView(Gtk.Box):
             d["active"] = True
             g.set_state(Gtk.EventSequenceState.CLAIMED)
         d["px"] = (d["x"] + dx, d["y"] + dy)
-        day, minutes = self._at(d["x"] + dx, d["y"] + dy)
+        day, minutes = self._at(d["x"] + dx, d["y"] + dy, end=d["mode"] in ("resize", "create"))
         at = self._dt(day, minutes)
         ev = d["event"]
         if d["mode"] == "move":
@@ -1540,7 +1626,7 @@ class NotionSetupDialog(Adw.Dialog):
         g = Adw.PreferencesGroup(
             description=(
                 "1. notion.so/profile/integrations 에서 새 통합(내부)을 만들고 토큰을 복사해요\n"
-                "2. 노션 📕 일기 데이터베이스 ⋯ 메뉴 → 연결 → 방금 만든 통합 추가\n"
+                "2. 노션 일기 데이터베이스(🎒 일기) ⋯ 메뉴 → 연결 → 방금 만든 통합 추가\n"
                 "3. 아래에 토큰을 붙여넣고 연결 확인"
             )
         )
@@ -1564,10 +1650,15 @@ class NotionSetupDialog(Adw.Dialog):
         tv = Adw.ToolbarView(content=box)
         tv.add_top_bar(header)
         self.set_child(tv)
+        self._closed = False
+        self.connect("closed", lambda *_: setattr(self, "_closed", True))
 
     def connect_check(self):
         token = self.token.get_text().strip()
         if not token:
+            return
+        if not token.isascii() or any(c.isspace() for c in token):
+            self.status.set_label("토큰에 들어갈 수 없는 글자가 있어요. 다시 복사해 붙여넣어 주세요")
             return
         cfg = diary.load_config()
         cfg["token"] = token
@@ -1579,9 +1670,13 @@ class NotionSetupDialog(Adw.Dialog):
                 name, err = diary.check(cfg), None
             except diary.NotionError as e:
                 name, err = None, str(e)
+            except Exception as e:  # 예상 못 한 오류에도 버튼이 멈추지 않게
+                name, err = None, f"확인 실패: {e}"
             GLib.idle_add(done, name, err)
 
         def done(name, err):
+            if self._closed:  # 취소했으면 저장도, 이어서 올리기도 하지 않는다
+                return False
             self.ok.set_sensitive(True)
             if err:
                 self.status.set_label(err)
@@ -1646,6 +1741,7 @@ class Window(Adw.ApplicationWindow):
         self.store.on_undoable = self._push_undo
         self._undo = []  # [(제목, 되돌릴 목록)]
         self._undo_toast = None
+        self._restoring = False
         undo_keys = Gtk.EventControllerKey()  # 버블 단계: 입력칸이 자기 Ctrl+Z 를 먼저 쓴다
         undo_keys.connect("key-pressed", self._on_undo_key)
         self.add_controller(undo_keys)
@@ -1767,9 +1863,10 @@ class Window(Adw.ApplicationWindow):
         self._memo_day = None
         self._memo_timer = None
         self._memo_loading = False
+        self._memo_dirty = False
 
         self.notion_btn = Gtk.Button(halign=Gtk.Align.CENTER, margin_top=4,
-                                     tooltip_text="할 일·일정·커밋·메모를 노션 📕 일기에 올려요")
+                                     tooltip_text="할 일·일정·커밋·메모를 노션 일기에 올려요")
         self.notion_btn.set_child(Adw.ButtonContent(icon_name="document-send-symbolic", label="노션 일기에 올리기"))
         self.notion_btn.add_css_class("pill")
         self.notion_btn.add_css_class("suggested-action")
@@ -1822,8 +1919,6 @@ class Window(Adw.ApplicationWindow):
         for name, accels, fn in (
             ("new", ["<Control>n"], lambda *_: self.new_event() if self.stack.get_visible_child_name() == "calendar" else self.task_entry.grab_focus()),
             ("today", ["<Control>t"], lambda *_: self.go_today()),
-            ("prev", ["Page_Up"], lambda *_: self.shift_period(-1)),
-            ("next", ["Page_Down"], lambda *_: self.shift_period(1)),
         ):
             act = Gio.SimpleAction.new(name, None)
             act.connect("activate", fn)
@@ -1833,34 +1928,48 @@ class Window(Adw.ApplicationWindow):
     # ── 동작 ──
     # ── 되돌리기 ──
     def _push_undo(self, label, summary, entries):
-        self._undo.append((summary, entries))
+        entry = (summary, entries)
+        self._undo.append(entry)
         del self._undo[:-30]
+        if self._undo_toast is not None:  # 다른 변경이 생기면 이전 알림의 되돌리기는 거둔다
+            self._undo_toast.dismiss()
         if label:  # 실수하기 쉬운 동작은 바로 되돌릴 수 있게 알림에 버튼
-            if self._undo_toast is not None:
-                self._undo_toast.dismiss()
             t = Adw.Toast(title=f"‘{summary}’ {label}" if summary else label, button_label="되돌리기", timeout=6)
-            t.connect("button-clicked", lambda *_: self.undo())
+            t.set_use_markup(False)
+            t.connect("button-clicked", lambda *_: self.undo(entry))
             t.connect("dismissed", lambda t: setattr(self, "_undo_toast", None) if self._undo_toast is t else None)
             self._undo_toast = t
             self.toasts.add_toast(t)
 
     def _on_undo_key(self, _c, keyval, _code, state):
+        if isinstance(self.get_focus(), (Gtk.Text, Gtk.TextView)):
+            return False  # 입력칸에서는 글자 되돌리기만 (되돌릴 글자가 없어도 일정은 건드리지 않는다)
         if keyval in (Gdk.KEY_z, Gdk.KEY_Z) and state & Gdk.ModifierType.CONTROL_MASK \
                 and not state & Gdk.ModifierType.SHIFT_MASK and self.get_visible_dialog() is None:
             self.undo()
             return True
         return False
 
-    def undo(self):
+    def undo(self, entry=None):
+        """맨 위 변경을 되돌린다. entry 가 주어지면(알림 버튼) 그게 맨 위일 때만."""
         if self._undo_toast is not None:
             self._undo_toast.dismiss()
+        if self._restoring or self.store.busy:
+            self.toast("아직 저장하는 중이에요. 잠시 후 다시 해주세요")
+            return
         if not self._undo:
             self.toast("되돌릴 게 없어요")
             return
-        summary, entries = self._undo.pop()
+        if entry is not None and self._undo[-1] is not entry:
+            self.toast("그 뒤에 바뀐 게 있어요. Ctrl+Z로 차례로 되돌려 주세요")
+            return
+        summary, entries = item = self._undo.pop()
+        self._restoring = True
 
         def done(err):
+            self._restoring = False
             if err:
+                self._undo.append(item)  # 실패하면 다시 시도할 수 있게 남겨 둔다
                 self.toast(f"되돌리기 실패: {err}")
             else:
                 self.toast(f"‘{summary}’ 되돌렸어요" if summary else "되돌렸어요")
@@ -1868,7 +1977,9 @@ class Window(Adw.ApplicationWindow):
         self.store.restore(entries, done)
 
     def toast(self, msg):
-        self.toasts.add_toast(Adw.Toast(title=msg, timeout=4))
+        t = Adw.Toast(title=msg, timeout=4)
+        t.set_use_markup(False)  # 제목에 & < 가 있어도 그대로
+        self.toasts.add_toast(t)
 
     def _sync_header(self):
         self.add_btn.set_visible(self.stack.get_visible_child_name() == "calendar")
@@ -1932,7 +2043,7 @@ class Window(Adw.ApplicationWindow):
         self.select_day(date.today())
 
     def select_day(self, d):
-        before = (self.month, self.week.week_start)
+        before = (self.month, getattr(self, "_shown_week", None))
         self.selected = d
         self.month = d.replace(day=1)
         self.refresh()
@@ -1968,14 +2079,20 @@ class Window(Adw.ApplicationWindow):
             self.new_event()
 
     ARROWS = {Gdk.KEY_Left: -1, Gdk.KEY_Right: 1, Gdk.KEY_Up: -7, Gdk.KEY_Down: 7}
+    PAGES = {Gdk.KEY_Page_Up: -1, Gdk.KEY_Page_Down: 1}
 
     def _on_key(self, _ctrl, keyval, _code, state):
-        if keyval not in self.ARROWS or self.stack.get_visible_child_name() != "calendar":
+        if keyval not in self.ARROWS and keyval not in self.PAGES:
             return False
-        if self.get_visible_dialog() is not None or isinstance(self.get_focus(), (Gtk.Text, Gtk.Entry)):
+        if self.stack.get_visible_child_name() != "calendar" or self.get_visible_dialog() is not None:
             return False
-        if state & (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.ALT_MASK):
+        if isinstance(self.get_focus(), (Gtk.Text, Gtk.Entry, Gtk.TextView)):
+            return False  # 글 쓰는 중이면 커서 이동
+        if state & (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.ALT_MASK | Gdk.ModifierType.SHIFT_MASK):
             return False
+        if keyval in self.PAGES:
+            self.shift_period(self.PAGES[keyval])
+            return True
         self.selected += timedelta(days=self.ARROWS[keyval])
         self.on_selection_changed()
         return True
@@ -2068,7 +2185,8 @@ class Window(Adw.ApplicationWindow):
         if ev is not None:
             s, e = self._stretched(ev, a, b)
             self._preview = replace(ev, start=s, end=e)
-            events = [self._preview if x is ev else x for x in self.events]
+            key = (ev.source_uid, ev.uid, ev.rid)
+            events = [self._preview if (x.source_uid, x.uid, x.rid) == key else x for x in self.events]
         else:
             cals = self.store.writable(ECal.ClientSourceType.EVENTS)
             self._preview = Event(uid="", rid="", source_uid=cals[0] if cals else "", summary="새 일정",
@@ -2094,7 +2212,7 @@ class Window(Adw.ApplicationWindow):
         elif not self.store.writable(ECal.ClientSourceType.EVENTS):
             self.toast("캘린더에 아직 연결 중이에요")
         else:
-            self.selected = a
+            self.select_day(a)
             EventDialog(self, day=a, span=(a, b)).present(self)
 
     @staticmethod
@@ -2139,12 +2257,13 @@ class Window(Adw.ApplicationWindow):
         comp.commit_sequence()
 
         # 구글 저장은 서버까지 다녀와서 1초 남짓 걸린다. 그동안 바뀐 길이를 먼저 보여준다
-        key = (ev.source_uid, ev.uid, ev.rid)
-        self._overrides[key] = (s, e)
+        key, token = (ev.source_uid, ev.uid, ev.rid), object()
+        self._overrides[key] = (s, e, token)
         self.refresh()
 
         def done(err):
-            self._overrides.pop(key, None)
+            if self._overrides.get(key, (None, None, None))[2] is token:
+                del self._overrides[key]
             if err:
                 self.toast(f"변경 실패: {err}")
                 self.refresh()  # 원래 길이로 되돌린다
@@ -2408,12 +2527,16 @@ class Window(Adw.ApplicationWindow):
         self._flush_memo()
         self._memo_day = d
         self._memo_loading = True
-        self.memo_view.get_buffer().set_text(diary.read_memo(d))
-        self._memo_loading = False
+        try:
+            self.memo_view.get_buffer().set_text(diary.read_memo(d))
+        finally:
+            self._memo_loading = False
+            self._memo_dirty = False
 
     def _memo_changed(self, _buf):
         if self._memo_loading:
             return
+        self._memo_dirty = True
         if self._memo_timer:
             GLib.source_remove(self._memo_timer)
         self._memo_timer = GLib.timeout_add(600, self._flush_memo)
@@ -2422,12 +2545,25 @@ class Window(Adw.ApplicationWindow):
         if self._memo_timer:
             GLib.source_remove(self._memo_timer)
             self._memo_timer = None
-        if self._memo_day is not None:
+        if self._memo_day is not None and self._memo_dirty:  # 바뀐 것만 (밖에서 고친 파일을 덮지 않게)
             buf = self.memo_view.get_buffer()
-            diary.write_memo(self._memo_day, buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False))
+            try:
+                diary.write_memo(self._memo_day, buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False))
+                self._memo_dirty = False
+            except OSError as e:
+                log("메모 저장 실패:", e)
+                self.toast(f"메모 저장 실패: {e}")
         return False
 
     # ── 노션 일기 ──
+    def open_diary(self):
+        """오늘 날짜 메모칸으로 (밤 일기 알림을 눌렀을 때)."""
+        self.stack.set_visible_child_name("calendar")
+        self.select_day(date.today())
+        if self.split.get_collapsed():
+            self.split.set_show_sidebar(True)
+        self.memo_view.grab_focus()
+
     def upload_diary(self):
         cfg = diary.load_config()
         if not cfg.get("token"):
@@ -2453,6 +2589,10 @@ class Window(Adw.ApplicationWindow):
                 if not blocks:
                     raise diary.NotionError("올릴 내용이 없어요")
                 url, err = diary.push(cfg, d, blocks), None
+                try:
+                    diary.mark_uploaded(d)
+                except OSError as e:  # 올리기는 성공했으니 기록 실패는 로그만
+                    log("업로드 기록 실패:", e)
             except diary.NotionError as e:
                 url, err = None, str(e)
             except Exception as e:  # 예상 못 한 오류도 버튼이 멈추지 않게
@@ -2464,8 +2604,10 @@ class Window(Adw.ApplicationWindow):
             if err:
                 self.toast(err)
                 return False
-            t = Adw.Toast(title=f"{diary.title_for(d)} 일기를 올렸어요", button_label="열기", timeout=6)
-            t.connect("button-clicked", lambda *_: Gio.AppInfo.launch_default_for_uri(url, None))
+            t = Adw.Toast(title=f"{diary.title_for(d)} 일기를 올렸어요", timeout=6)
+            if url:
+                t.set_button_label("열기")
+                t.connect("button-clicked", lambda *_: Gio.AppInfo.launch_default_for_uri(url, None))
             self.toasts.add_toast(t)
             return False
 
@@ -2522,7 +2664,8 @@ textview.memo, textview.memo text { background: transparent; }
 
 class App(Adw.Application):
     def __init__(self):
-        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
+        self.add_main_option("diary", 0, GLib.OptionFlags.NONE, GLib.OptionArg.NONE, "오늘 날짜 메모칸으로 열기", None)
         quit_ = Gio.SimpleAction.new("quit", None)
         quit_.connect("activate", lambda *_: self.quit())
         self.add_action(quit_)
@@ -2532,6 +2675,44 @@ class App(Adw.Application):
         win = self.get_active_window() or Window(self)
         win.present()
 
+    def do_shutdown(self):
+        for win in self.get_windows():  # Ctrl+Q·로그아웃도 메모를 남기고 끈다
+            if hasattr(win, "_flush_memo"):
+                win._flush_memo()
+        Adw.Application.do_shutdown(self)
+
+    def do_command_line(self, cmdline):
+        # 이미 떠 있으면 두 번째 실행의 인자가 여기로 전달된다
+        self.activate()
+        if cmdline.get_options_dict().contains("diary"):
+            self.get_active_window().open_diary()
+        return 0
+
+
+def remind():
+    """밤 일기 알림 (systemd 타이머가 부른다). 이미 올렸으면 조용히 끝."""
+    today = date.today()
+    if datetime.now().hour < 21 and not os.environ.get("HARU_REMIND_NOW"):
+        return 0  # 절전 중에 지나간 알림이 다음 날 아침에 뜨지 않게
+    if diary.is_uploaded(today):
+        return 0
+    try:
+        if diary.find_page(diary.load_config(), today):  # 노션에서 직접 쓴 경우
+            return 0
+    except Exception as e:  # 토큰 없음·오프라인이면 그냥 알린다
+        log("일기 확인 실패:", e)
+    res = subprocess.run(
+        ["notify-send", "-a", "하루", "-i", "x-office-calendar", "-A", "default=열기", "-A", "open=일기 쓰기",
+         "오늘 일기 올릴까요?", "할 일 체크하고 메모 쓴 다음 '노션 일기에 올리기'를 눌러요"],
+        capture_output=True, text=True)
+    if res.stdout.strip() in ("default", "open"):
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), "--diary"], start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return 0
+
 
 if __name__ == "__main__":
+    setup_log()
+    if "--remind" in sys.argv[1:]:
+        sys.exit(remind())
     sys.exit(App().run(sys.argv))

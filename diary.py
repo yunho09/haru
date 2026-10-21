@@ -1,20 +1,24 @@
 """하루 → 노션 일기.
 
 선택한 날의 할 일 · 일정 · git 커밋 · 메모를 모아 노션 일기 데이터베이스에
-"2026-10-15" 페이지로 올린다. 같은 날 페이지가 있으면 내용을 새로 덮어쓴다.
+"2026-10-15" 페이지로 올린다. 올리는 내용은 "📒 하루 기록" 상자(콜아웃) 하나에 담고,
+다시 올리면 그 상자만 바꾼다 — 노션에서 직접 쓴 글은 건드리지 않는다.
 
 설정: ~/.config/haru/notion.json
     {"token": "ntn_...", "database_id": "...", "project_root": "/data/project"}
 """
+import http.client
 import json
 import os
 import subprocess
+import time
 import urllib.error
 import urllib.request
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
 CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "haru" / "notion.json"
+UPLOADED = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "haru" / "uploaded"
 MEMO_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "haru" / "memo"
 DEFAULT_DATABASE = "3977a4d61474805eb40ccea9b6d918ff"  # 🎒 일기 (기존 일기들이 있는 곳)
 TITLE_PROP = "이름"
@@ -40,8 +44,11 @@ def load_config():
 
 def save_config(cfg):
     CONFIG.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG.write_text(json.dumps(cfg, ensure_ascii=False, indent=2))
-    CONFIG.chmod(0o600)  # 토큰이 들어 있다
+    # 토큰이 들어 있으니 처음부터 나만 읽을 수 있게 만든다
+    fd = os.open(CONFIG, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(json.dumps(cfg, ensure_ascii=False, indent=2))
+    CONFIG.chmod(0o600)
 
 
 def memo_path(day):
@@ -50,8 +57,8 @@ def memo_path(day):
 
 def read_memo(day):
     try:
-        return memo_path(day).read_text()
-    except OSError:
+        return memo_path(day).read_text(encoding="utf-8")
+    except (OSError, ValueError):  # 없거나 깨진 파일
         return ""
 
 
@@ -59,9 +66,27 @@ def write_memo(day, text):
     p = memo_path(day)
     if text.strip():
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(text)
+        p.write_text(text, encoding="utf-8")
     elif p.exists():
         p.unlink()
+
+
+def mark_uploaded(day):
+    """올린 날짜를 기록한다 (밤 알림이 이미 올린 날은 건너뛰게). 최근 90일만 남긴다."""
+    days = sorted(set(_uploaded_days()) | {day.isoformat()})[-90:]
+    UPLOADED.parent.mkdir(parents=True, exist_ok=True)
+    UPLOADED.write_text("\n".join(days) + "\n")
+
+
+def is_uploaded(day):
+    return day.isoformat() in _uploaded_days()
+
+
+def _uploaded_days():
+    try:
+        return [x for x in UPLOADED.read_text().split() if x]
+    except OSError:
+        return []
 
 
 # ───────────────────────── 모으기 ─────────────────────────
@@ -79,7 +104,7 @@ def commits(day, root):
     for repo in sorted(Path(root).iterdir()) if Path(root).is_dir() else []:
         if not (repo / ".git").exists():
             continue
-        cmd = ["git", "-C", str(repo), "log", "--all", "--no-merges", "--reverse",
+        cmd = ["git", "-C", str(repo), "log", "--exclude=refs/stash", "--all", "--no-merges", "--reverse",
                f"--since={since:%Y-%m-%d %H:%M}", f"--until={until:%Y-%m-%d %H:%M}", "--format=%s"]
         if email:
             cmd.append(f"--author={email}")
@@ -100,7 +125,7 @@ def build_entry(day, todos, events, commit_list, memo):
     blocks = []
 
     def heading(text):
-        blocks.append({"type": "heading_2", "heading_2": {"rich_text": rich(text)}})
+        blocks.append({"type": "heading_3", "heading_3": {"rich_text": rich(text)}})
 
     if todos:
         heading("✅ 할 일")
@@ -143,7 +168,7 @@ def title_for(day):
 
 # ───────────────────────── 노션 ─────────────────────────
 
-def _call(token, method, path, body=None):
+def _call(token, method, path, body=None, tries=4):
     req = urllib.request.Request(
         API + path, method=method,
         data=json.dumps(body).encode() if body is not None else None,
@@ -157,6 +182,13 @@ def _call(token, method, path, body=None):
         with urllib.request.urlopen(req, timeout=20) as res:
             return json.loads(res.read() or b"{}")
     except urllib.error.HTTPError as e:
+        if e.code in (429, 502, 503) and tries > 1:  # 요청 제한·일시 오류는 잠깐 쉬고 다시
+            try:
+                wait = float(e.headers.get("Retry-After") or 1)
+            except ValueError:
+                wait = 1
+            time.sleep(min(wait, 10))
+            return _call(token, method, path, body, tries - 1)
         try:
             info = json.loads(e.read())
         except ValueError:
@@ -169,6 +201,10 @@ def _call(token, method, path, body=None):
         raise NotionError(info.get("message") or f"HTTP {e.code}") from None
     except urllib.error.URLError as e:
         raise NotionError(f"인터넷 연결을 확인해 주세요 ({e.reason})") from None
+    except (OSError, http.client.HTTPException) as e:  # 읽다가 끊김·시간 초과
+        raise NotionError(f"노션과 통신하다 끊겼어요 ({e})") from None
+    except ValueError:
+        raise NotionError("노션 응답을 읽지 못했어요") from None
 
 
 def check(cfg):
@@ -177,38 +213,89 @@ def check(cfg):
     return "".join(t.get("plain_text", "") for t in db.get("title", [])) or "일기"
 
 
-def push(cfg, day, blocks):
-    """그날 페이지를 만들거나 덮어쓰고 페이지 URL 을 돌려준다."""
-    token, db = cfg["token"], cfg["database_id"]
-    title = title_for(day)
-    found = _call(token, "POST", f"/databases/{db}/query", {
-        "filter": {"property": TITLE_PROP, "title": {"equals": title}},
+def find_page(cfg, day):
+    """그날 일기 페이지 (없으면 None)."""
+    if not cfg.get("token"):
+        return None
+    found = _call(cfg["token"], "POST", f"/databases/{cfg['database_id']}/query", {
+        "filter": {"property": TITLE_PROP, "title": {"equals": title_for(day)}},
         "page_size": 1,
     }).get("results", [])
-    if found:
-        page = found[0]
-        # 기존 내용을 지우고 새로 채운다
-        cursor = None
-        old = []
-        while True:
-            q = "?page_size=100" + (f"&start_cursor={cursor}" if cursor else "")
-            res = _call(token, "GET", f"/blocks/{page['id']}/children{q}")
-            old += [b["id"] for b in res.get("results", [])]
-            if not res.get("has_more"):
-                break
-            cursor = res.get("next_cursor")
-        for block_id in old:
-            _call(token, "DELETE", f"/blocks/{block_id}")
-        for i in range(0, len(blocks), 100):
-            _call(token, "PATCH", f"/blocks/{page['id']}/children", {"children": blocks[i:i + 100]})
+    return found[0] if found else None
+
+
+HARU_TITLE = "하루 기록"
+HARU_ICON = "📒"
+_me_cache = {}
+
+
+def _section(blocks):
+    """하루가 올리는 내용을 담는 상자. 한 번에 자식 100개까지라 나머지는 따로 붙인다."""
+    return {"type": "callout", "callout": {
+        "rich_text": rich(HARU_TITLE), "icon": {"type": "emoji", "emoji": HARU_ICON},
+        "color": "gray_background", "children": blocks[:100]}}
+
+
+def is_haru_section(block):
+    if block.get("type") != "callout":
+        return False
+    c = block["callout"]
+    text = "".join(t.get("plain_text") or (t.get("text") or {}).get("content", "") for t in c.get("rich_text", []))
+    return text == HARU_TITLE and (c.get("icon") or {}).get("emoji") == HARU_ICON
+
+
+def _children(token, block_id):
+    out, cursor = [], None
+    while True:
+        q = "?page_size=100" + (f"&start_cursor={cursor}" if cursor else "")
+        res = _call(token, "GET", f"/blocks/{block_id}/children{q}")
+        out += res.get("results", [])
+        if not res.get("has_more"):
+            return out
+        cursor = res.get("next_cursor")
+
+
+def _me(token):
+    if token not in _me_cache:
+        _me_cache[token] = _call(token, "GET", "/users/me").get("id")
+    return _me_cache[token]
+
+
+def _append(token, parent_id, blocks):
+    for i in range(0, len(blocks), 100):
+        _call(token, "PATCH", f"/blocks/{parent_id}/children", {"children": blocks[i:i + 100]})
+
+
+def old_haru_blocks(children, me):
+    """이번에 바꿀 하루 몫의 블록: 하루 기록 상자들, 그리고 상자 없던 시절 하루가 만들고 아무도 안 고친 블록."""
+    boxes = [b["id"] for b in children if is_haru_section(b)]
+    if boxes:
+        return boxes
+    return [b["id"] for b in children
+            if (b.get("created_by") or {}).get("id") == me and (b.get("last_edited_by") or {}).get("id") == me]
+
+
+def push(cfg, day, blocks):
+    """그날 페이지에 하루 기록 상자를 만들거나 바꾸고 페이지 URL 을 돌려준다.
+    새 상자를 먼저 붙이고 옛 상자를 지운다 — 중간에 끊겨도 내용이 비지 않게."""
+    token, db = cfg["token"], cfg["database_id"]
+    page = find_page(cfg, day)
+    if page is None:
+        page = _call(token, "POST", "/pages", {
+            "parent": {"database_id": db},
+            "properties": {TITLE_PROP: {"title": [{"type": "text", "text": {"content": title_for(day)}}]}},
+            "children": [_section(blocks)],
+        })
+        if len(blocks) > 100:
+            box = next(b for b in _children(token, page["id"]) if is_haru_section(b))
+            _append(token, box["id"], blocks[100:])
         return page.get("url", "")
-    page = _call(token, "POST", "/pages", {
-        "parent": {"database_id": db},
-        "properties": {TITLE_PROP: {"title": [{"type": "text", "text": {"content": title}}]}},
-        "children": blocks[:100],
-    })
-    for i in range(100, len(blocks), 100):
-        _call(token, "PATCH", f"/blocks/{page['id']}/children", {"children": blocks[i:i + 100]})
+    old = old_haru_blocks(_children(token, page["id"]), _me(token))
+    res = _call(token, "PATCH", f"/blocks/{page['id']}/children", {"children": [_section(blocks)]})
+    if len(blocks) > 100:
+        _append(token, res["results"][0]["id"], blocks[100:])
+    for block_id in old:
+        _call(token, "DELETE", f"/blocks/{block_id}")
     return page.get("url", "")
 
 

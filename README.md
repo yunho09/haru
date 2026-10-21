@@ -23,7 +23,10 @@ GNOME용 가벼운 일정·할 일 관리 앱. GTK4 + libadwaita (Python).
 - 일일 투두: 사이드바에서 그 날짜 마감 할 일을 바로 추가·체크 (구글 할 일과 동기화)
 - 날짜별 메모 (`~/.local/share/haru/memo/`)
 - **노션 일기에 올리기**: 그날의 할 일(체크 상태)·일정·git 커밋(`/data/project` 아래 레포)·메모를
-  노션 🎒 일기 데이터베이스에 `2026-10-15` 페이지로 올림. 같은 날 다시 올리면 덮어씀
+  노션 🎒 일기 데이터베이스의 `2026-10-15` 페이지에 "📒 하루 기록" 상자로 올림. 다시 올리면 그 상자만
+  바뀌고, 노션에서 직접 쓴 글은 그대로 둠
+- **밤 일기 알림**: 밤 10시에 그날 일기를 아직 안 올렸으면 알림, 누르면 오늘 메모칸으로 열림 (자동 업로드는 안 함)
+- Ctrl+Z 되돌리기, 오류 로그 `~/.local/state/haru/haru.log`
 
 ## 실행
 
@@ -45,6 +48,17 @@ sudo apt install gir1.2-adw-1 gir1.2-ecal-2.0 gir1.2-edataserver-1.2 gir1.2-ical
 
 설정은 `~/.config/haru/notion.json` (권한 600)에 저장된다. 데이터베이스나 레포 위치를 바꾸려면
 이 파일의 `database_id`, `project_root` 를 고친다.
+
+## 밤 일기 알림
+
+```sh
+cp systemd/haru-diary-remind.* ~/.config/systemd/user/   # ExecStart 경로를 클론한 위치로
+systemctl --user daemon-reload
+systemctl --user enable --now haru-diary-remind.timer
+```
+
+시각을 바꾸려면 `haru-diary-remind.timer` 의 `OnCalendar` 를 고친다. 그날 일기가 이미 있으면 알리지 않고,
+절전 중에 지나간 알림이 다음 날 아침에 뜨지 않게 21시 이후에만 알린다.
 
 ## 단축키
 
