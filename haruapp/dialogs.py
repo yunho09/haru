@@ -14,7 +14,7 @@ from gi.repository import Adw, ECal, GLib, Gtk, ICalGLib  # noqa: E402
 from . import diary  # noqa: E402
 from .core import (  # noqa: E402
     REMINDERS, DEFAULT_REMINDER, REPEATS, CUSTOM_REPEAT, KEEP, ical_to_py, comp_dt, as_date,
-    text_of, parse_rule, repeat_index, rule_until, build_rule, reminder_index, set_reminder,
+    text_of, parse_rule, repeat_index, rule_until, build_rule, reminder_index, set_reminder, rule_start_problem,
 )
 from .widgets import DateButton, TimeEntry, combo_row  # noqa: E402
 
@@ -213,6 +213,9 @@ class EventDialog(Adw.Dialog):
         if r_idx and r_until is not None and r_until < as_date(s):
             self.win.toast("반복 종료일이 시작일보다 빨라요")
             return
+        if rule_changed and (problem := rule_start_problem(r_idx, s)):
+            self.win.toast(problem)
+            return
 
         def fill(comp, cs, ce, rule=KEEP):
             if rule is not KEEP:
@@ -281,12 +284,17 @@ class EventDialog(Adw.Dialog):
             shift = as_date(s) - as_date(ev.start)
             if rule_changed:
                 if r_idx == 0:  # 반복을 끄면 지금 연 회차 자리에 일정 하나만 남긴다
-                    ms, me = s, e
-                else:  # 규칙을 새로 만들면 요일·날짜도 새 시작일 기준이라 날짜 이동도 가능
-                    m_day = as_date(ical_to_py(master.get_dtstart().get_value())) + shift
-                    ms = m_day if not isinstance(s, datetime) else datetime.combine(m_day, s.time())
-                    me = ms + (e - s)
-                self.store.modify(src, fill(master, ms, me, build_rule(r_idx, ms, r_until)), mod, done)
+                    # 따로 떼어냈던 회차들도 지운다 — 안 그러면 다른 앱(폰·상단바)에 떨어진 일정으로 남는다
+                    after = lambda err: done(err) if err else self.store.remove_detached(src, ev.uid, done)  # noqa: E731
+                    self.store.modify(src, fill(master, s, e, ""), mod, after)
+                    return
+                # 규칙을 새로 만들면 요일·날짜도 새 시작일 기준이라 날짜 이동도 가능
+                m_day = as_date(ical_to_py(master.get_dtstart().get_value())) + shift
+                ms = m_day if not isinstance(s, datetime) else datetime.combine(m_day, s.time())
+                if problem := rule_start_problem(r_idx, ms):
+                    done(problem)
+                    return
+                self.store.modify(src, fill(master, ms, ms + (e - s), build_rule(r_idx, ms, r_until)), mod, done)
                 return
             if shift.days != 0:
                 # 반복 규칙(예: 매주 월요일)은 그대로라 날짜만 옮기면 일정이 깨진다

@@ -130,6 +130,33 @@ class StoreUndo(unittest.TestCase):
         self.assertEqual(sorted(s for s, _ in self.times()),
                          [datetime(2026, 10, d, 9) for d in (19, 20, 21)])
 
+    def test_turning_off_repeat_removes_detached_and_undo_brings_back(self):
+        self.make(datetime(2026, 10, 5, 9), datetime(2026, 10, 5, 10), rule="FREQ=WEEKLY;BYDAY=MO;COUNT=4")
+        ev = self.instance(datetime(2026, 10, 12, 9))
+        comp = ECal.Component.new_from_icalcomponent(ev.icomp.clone())  # 12일 회차를 13일 15시로 떼어냄
+        for clear in (comp.set_rrules, comp.set_rdates, comp.set_exrules, comp.set_exdates):
+            clear(None)
+        comp.set_dtstart(comp_dt(datetime(2026, 10, 13, 15)))
+        comp.set_dtend(comp_dt(datetime(2026, 10, 13, 16)))
+        comp.commit_sequence()
+        self.assertIsNone(self.run_op(self.store.modify, CAL, comp, ECal.ObjModType.THIS, record=False))
+        series = sorted(self.times())
+
+        # 대화상자에서 19일 회차를 열고 '반복 안 함' → 원본을 그 자리 하나로 + 떼어낸 회차 삭제
+        master = self.store.master(CAL, self.uid)
+        master.set_rrules(None)
+        master.set_dtstart(comp_dt(datetime(2026, 10, 19, 9)))
+        master.set_dtend(comp_dt(datetime(2026, 10, 19, 10)))
+        master.commit_sequence()
+        self.assertIsNone(self.run_op(self.store.modify, CAL, master, ECal.ObjModType.ALL))
+        undo = self.records[-1]
+        self.assertIsNone(self.run_op(self.store.remove_detached, CAL, self.uid))
+        self.assertEqual(len(self.store.snapshot(CAL, self.uid)), 1)  # 고아 회차 없음
+        self.assertEqual(self.times(), [(datetime(2026, 10, 19, 9), datetime(2026, 10, 19, 10))])
+
+        self.assertIsNone(self.run_op(self.store.restore, undo))  # 되돌리면 반복과 떼어낸 회차까지
+        self.assertEqual(sorted(self.times()), series)
+
     def test_move_then_restore(self):
         comp = self.make(date(2026, 10, 27), date(2026, 10, 28))
         self.assertIsNone(self.run_op(self.store.move, CAL, CAL, comp))  # 같은 캘린더로 옮기기 = uid 가 바뀐다

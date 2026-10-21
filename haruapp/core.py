@@ -203,6 +203,14 @@ def rule_until(r):
     return dt.date()
 
 
+def rule_start_problem(idx, start):
+    """규칙과 시작일이 안 맞으면 알릴 문구, 맞으면 None.
+    평일 반복을 주말에 시작하면 그 주말 하루가 회차로 하나 더 생긴다 (RFC 5545: 시작일은 항상 첫 회차)."""
+    if idx == 2 and as_date(start).weekday() >= 5:
+        return "평일 반복은 월~금에 시작해야 해요. 시작일을 평일로 골라 주세요"
+    return None
+
+
 def build_rule(idx, start, until):
     """REPEATS 인덱스 → RRULE 문자열 ("" 이면 반복 없음)."""
     if idx == 0:

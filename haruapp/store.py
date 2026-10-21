@@ -408,6 +408,24 @@ class Store:
 
         run()
 
+    def remove_detached(self, source_uid, uid, done):
+        """반복에서 떼어냈던 회차들을 지운다 (반복을 끈 뒤 남은 것). 되돌리기는 앞의 수정 기록이 맡는다."""
+        client = self.clients.get(source_uid)
+        rids = [r for r in (ECal.Component.new_from_icalcomponent(ic.clone()).get_recurid_as_string()
+                            for ic in self.snapshot(source_uid, uid)) if r]
+        if client is None or not rids:
+            done(None)
+            return
+
+        def step(i=0, err=None):
+            if err or i == len(rids):
+                done(err)
+                return
+            client.remove_object(uid, rids[i], ECal.ObjModType.THIS, ECal.OperationFlags.NONE, None,
+                                 self._finish("remove", lambda e: step(i + 1, e)), None)
+
+        step()
+
     def master(self, source_uid, uid):
         client = self.clients.get(source_uid)
         if client is None:

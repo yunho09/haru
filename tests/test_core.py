@@ -4,7 +4,8 @@ from datetime import date, datetime, timedelta
 
 from haruapp.core import (
     WEEKDAY_CODES, Event, assign_lanes, build_rule, drag_range, fmt_day, ical_to_py, overlap_columns,
-    parse_rule, py_to_ical, reminder_index, repeat_index, rule_until, set_reminder, stretched_times,
+    parse_rule, py_to_ical, reminder_index, repeat_index, rule_start_problem, rule_until, set_reminder,
+    stretched_times,
 )
 
 
@@ -93,6 +94,12 @@ class Rules(unittest.TestCase):
         until = parse_rule(rule)["UNTIL"]
         self.assertTrue(until.endswith("Z"))
         self.assertEqual(rule_until(parse_rule(rule)), date(2026, 10, 31))
+
+    def test_weekday_rule_must_start_on_a_weekday(self):
+        self.assertIsNotNone(rule_start_problem(2, date(2026, 10, 24)))  # 토요일
+        self.assertIsNotNone(rule_start_problem(2, datetime(2026, 10, 25, 9)))  # 일요일
+        self.assertIsNone(rule_start_problem(2, self.WED))
+        self.assertIsNone(rule_start_problem(3, date(2026, 10, 24)))  # 매주는 토요일 시작도 괜찮다
 
     def test_until_for_all_day_is_date(self):
         rule = build_rule(1, date(2026, 10, 21), date(2026, 10, 31))
