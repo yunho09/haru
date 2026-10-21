@@ -260,6 +260,11 @@ def set_reminder(comp, idx):
     comp.add_alarm(alarm)
 
 
+
+def task_label(t):
+    """캘린더에 보이는 할 일 문구: ○ 할 것 / ✓ 한 것."""
+    return f"{'✓' if t.done else '○'} {t.summary}"
+
 # ───────────────────────── 배치·드래그 계산 (화면과 무관한 부분) ─────────────────────────
 
 def assign_lanes(spans, week_first):

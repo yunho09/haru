@@ -14,7 +14,9 @@ gi.require_version("Graphene", "1.0")
 from gi.repository import Adw, ECal, Gdk, Gio, GLib, GObject, Graphene, Gtk, ICalGLib, Pango  # noqa: E402
 
 from . import diary  # noqa: E402
-from .core import WEEKDAYS, Event, assign_lanes, comp_dt, drag_range, fmt_day, fmt_time, stretched_times  # noqa: E402
+from .core import (  # noqa: E402
+    WEEKDAYS, Event, assign_lanes, comp_dt, drag_range, fmt_day, fmt_time, stretched_times, task_label,
+)
 from .log import log  # noqa: E402
 from .store import Store  # noqa: E402
 from .widgets import DateButton  # noqa: E402
@@ -63,6 +65,7 @@ class Window(Adw.ApplicationWindow):
         self.split.connect("notify::collapsed", lambda *_: self._sync_header())
 
         self._overrides = {}  # (캘린더, uid, rid) → 저장 중인 (시작, 끝)
+        self._task_overrides = {}  # (목록, uid) → (바뀐 필드, 토큰) — 할 일 완료·마감일 바꾼 걸 먼저 보여준다
         self._shortcuts()
         self.connect("close-request", lambda *_: self._flush_memo() and False)
         keys = Gtk.EventControllerKey()
@@ -456,8 +459,10 @@ class Window(Adw.ApplicationWindow):
         w = self.grid.pick(x, y, Gtk.PickFlags.DEFAULT)
         event = chip = None
         while w is not None and w is not self.grid:
-            if event is None and getattr(w, "event", None) is not None:
+            if chip is None and getattr(w, "event", None) is not None:
                 event, chip = w.event, w
+            elif chip is None and getattr(w, "task", None) is not None:
+                chip = w  # 할 일 칩
             if hasattr(w, "cell"):
                 return w, event, chip
             w = w.get_parent()
@@ -485,11 +490,14 @@ class Window(Adw.ApplicationWindow):
             grab = (0, 0)
             if chip is not None:
                 ok, p = self.grid.compute_point(chip, Graphene.Point().init(x, y))
-                mode = (self._chip_edge(chip, p.x) if ok else None) or "move"
+                if event is None:
+                    mode = "task"
+                else:
+                    mode = (self._chip_edge(chip, p.x) if ok else None) or "move"
                 grab = (p.x, p.y) if ok else (0, 0)
             self._drag = {"x": x, "y": y, "origin": btn.cell["date"], "target": btn.cell["date"],
-                          "event": event, "mode": mode, "active": False, "grab": grab,
-                          "chip_w": btn.get_width() - 8}
+                          "event": event, "task": getattr(chip, "task", None), "mode": mode, "active": False,
+                          "grab": grab, "chip_w": btn.get_width() - 8}
 
     def _drag_update(self, g, dx, dy):
         d = self._drag
@@ -500,16 +508,19 @@ class Window(Adw.ApplicationWindow):
                 return
             d["active"] = True
             g.set_state(Gtk.EventSequenceState.CLAIMED)
-            if d["mode"] == "move":
-                ev = d["event"]
-                self.float_chip.set_label(ev.summary if ev.all_day else f"{ev.start:%H:%M} {ev.summary}")
+            if d["mode"] in ("move", "task"):
+                item = d["event"] or d["task"]
+                if d["task"] is not None:
+                    self.float_chip.set_label(task_label(item))
+                else:
+                    self.float_chip.set_label(item.summary if item.all_day else f"{item.start:%H:%M} {item.summary}")
                 for cls in list(self.float_chip.get_css_classes()):
                     if cls.startswith("c") and cls[1:].isdigit():
                         self.float_chip.remove_css_class(cls)
-                self.float_chip.add_css_class(self._color_class.get(ev.source_uid, "c0"))
+                self.float_chip.add_css_class(self._color_class.get(item.source_uid, "c0"))
                 self.float_chip.set_size_request(max(d["chip_w"], 60), -1)
                 self.float_chip.set_visible(True)
-        if d["mode"] == "move":  # 막대가 칸에 맞춰지기 전에도 마우스를 부드럽게 따라온다
+        if d["mode"] in ("move", "task"):  # 막대가 칸에 맞춰지기 전에도 마우스를 부드럽게 따라온다
             ok, p = self.grid.compute_point(self.month_overlay,
                                             Graphene.Point().init(d["x"] + dx - d["grab"][0], d["y"] + dy - d["grab"][1]))
             if ok:
@@ -519,6 +530,10 @@ class Window(Adw.ApplicationWindow):
         if btn is None or (d.get("shown") == btn.cell["date"]):
             return
         d["target"] = d["shown"] = btn.cell["date"]
+        if d["mode"] == "task":  # 할 일은 놓을 칸만 표시
+            for cell in self.cells:
+                (cell.add_css_class if cell.cell["date"] == d["target"] else cell.remove_css_class)("drag-range")
+            return
         a, b = self._drag_range(d)
         for cell in self.cells:
             on = a <= cell.cell["date"] <= b
@@ -544,6 +559,10 @@ class Window(Adw.ApplicationWindow):
         for cell in self.cells:
             cell.remove_css_class("drag-range")
         if d is None or not d["active"]:
+            return
+        if d["mode"] == "task":
+            if d["target"] != d["task"].due:
+                self.reschedule_task(d["task"], d["target"])
             return
         a, b = self._drag_range(d)
         if d["event"] is None or (a, b) == d["event"].days():
@@ -633,7 +652,28 @@ class Window(Adw.ApplicationWindow):
         entry.set_text("")
         self.store.create(src, comp, lambda err: err and self.toast(f"추가 실패: {err}"))
 
-    def toggle_task(self, task, done):
+    def _save_task(self, task, comp, fields, label=None):
+        """할 일 변경을 바로 보여주고(구글 저장은 1초쯤 걸린다) 뒤에서 저장한다."""
+        key, token = (task.source_uid, task.uid), object()
+        self._task_overrides[key] = (fields, token)
+        GLib.idle_add(lambda: self.refresh() and False)  # 체크박스 신호 처리 중에 목록을 지우지 않게
+
+        def done(err):
+            if self._task_overrides.get(key, (None, None))[1] is token:
+                del self._task_overrides[key]
+            if err:
+                self.toast(f"변경 실패: {err}")
+                self.refresh()
+
+        self.store.modify(task.source_uid, comp, ECal.ObjModType.ALL, done, label=label)
+
+    def reschedule_task(self, task, day):
+        comp = ECal.Component.new_from_icalcomponent(task.icomp.clone())
+        comp.set_due(comp_dt(day))
+        comp.commit_sequence()
+        self._save_task(task, comp, {"due": day}, label="마감일을 옮겼어요")
+
+    def toggle_task(self, task, done, label=None):
         comp = ECal.Component.new_from_icalcomponent(task.icomp.clone())
         if done:
             comp.set_status(ICalGLib.PropertyStatus.COMPLETED)
@@ -644,8 +684,7 @@ class Window(Adw.ApplicationWindow):
             comp.set_percent_complete(0)
             comp.set_completed(None)
         comp.commit_sequence()
-        self.store.modify(task.source_uid, comp, ECal.ObjModType.ALL,
-                          lambda err: err and self.toast(f"변경 실패: {err}"))
+        self._save_task(task, comp, {"done": done, "completed": date.today() if done else None}, label=label)
 
     def delete_task(self, task, after=None):
         def done(err):
@@ -693,6 +732,7 @@ class Window(Adw.ApplicationWindow):
             css.append(f".chip.c{i} {{ background-color: alpha({color}, .22); border-left: 3px solid {color}; }}")
             css.append(f".bar.c{i} {{ background-color: {color}; }}")
             css.append(f".chip.floating.c{i} {{ background-color: mix(@window_bg_color, {color}, .35); }}")
+            css.append(f".month-cell .chip.task.c{i} {{ background-color: transparent; border: 1px solid alpha({color}, .7); }}")
         self.css.load_from_string(BASE_CSS + "\n".join(css))
 
     def refresh(self):
@@ -707,7 +747,10 @@ class Window(Adw.ApplicationWindow):
                 if (k := (e.source_uid, e.uid, e.rid)) in self._overrides else e
                 for e in self.events
             ]
-        self.all_tasks = self.store.tasks()
+        self.all_tasks = [
+            replace(t, **self._task_overrides[k][0]) if (k := (t.source_uid, t.uid)) in self._task_overrides else t
+            for t in self.store.tasks()
+        ]
         self._update_title()
         self._grid_start = start
         self._preview = None
@@ -793,12 +836,38 @@ class Window(Adw.ApplicationWindow):
                     lab.add_controller(motion)
                 lab.set_tooltip_text(f"{e.summary}\n끌어서 옮기기 · 끝을 잡고 끌면 기간 조절")
                 chips.append(lab)
+            # 그날 마감인 할 일: 남은 줄에 (안 한 것 먼저), 넘치면 +N 에 포함
+            day_tasks = sorted((t for t in getattr(self, "all_tasks", []) if t.due == d),
+                               key=lambda t: (t.done, t.summary))
+            room = max(MAX_LANES - (max(visible) + 1 if visible else 0), 0)
+            for t in day_tasks[:room]:
+                chips.append(self._task_chip(t, d))
+            hidden += max(len(day_tasks) - room, 0)
             if hidden:
                 more = Gtk.Label(label=f"+{hidden}개", xalign=0)
                 more.add_css_class("more")
                 chips.append(more)
             btn.set_tooltip_text("\n".join(
-                (e.summary if e.all_day else f"{fmt_time(e.start)} {e.summary}") for e in day_events) or None)
+                [(e.summary if e.all_day else f"{fmt_time(e.start)} {e.summary}") for e in day_events]
+                + [task_label(t) for t in day_tasks]) or None)
+
+    def _task_chip(self, t, d):
+        lab = Gtk.Label(label=task_label(t), xalign=0, ellipsize=Pango.EllipsizeMode.END, max_width_chars=1,
+                        hexpand=True)
+        for cls in ("chip", "task", self._color_class.get(t.source_uid, "c0")) + (("done",) if t.done else ()):
+            lab.add_css_class(cls)
+        lab.task, lab.day = t, d
+        lab.set_cursor_from_name("pointer")
+        lab.set_tooltip_text(f"{t.summary}\n누르면 {'완료 취소' if t.done else '완료'} · 끌어서 마감일 바꾸기")
+        click = Gtk.GestureClick()
+        # 누르는 도중에 칸을 다시 그리면 안 되니 처리는 한 박자 뒤에
+        click.connect("released", lambda *_: GLib.idle_add(self._toggle_from_calendar, t))
+        lab.add_controller(click)
+        return lab
+
+    def _toggle_from_calendar(self, t):
+        self.toggle_task(t, not t.done, label="완료를 취소했어요" if t.done else "완료했어요")
+        return False
 
     def _render_selection(self):
         for btn in self.cells:
@@ -963,6 +1032,7 @@ BASE_CSS = """
 .month-cell { padding: 4px 0; margin: 0; border-radius: 10px; min-height: 64px;
               transition: background-color 180ms ease-out, box-shadow 180ms ease-out; }
 .chip.floating { margin: 0; font-weight: 700; box-shadow: 0 8px 18px alpha(black, .45); }
+.month-cell .chip.task.done { opacity: .55; text-decoration-line: line-through; }
 .month-cell .day-num { margin-left: 4px; }
 .month-cell.drag-range { background-color: alpha(@accent_bg_color, .20); }
 .month-cell .chip.dragging { font-weight: 700; box-shadow: inset 0 2px alpha(@accent_bg_color, .95), inset 0 -2px alpha(@accent_bg_color, .95); }

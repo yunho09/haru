@@ -9,7 +9,7 @@ gi.require_version("ECal", "2.0")
 gi.require_version("PangoCairo", "1.0")
 from gi.repository import Adw, ECal, Gdk, GLib, Gtk, Pango, PangoCairo  # noqa: E402
 
-from .core import WEEKDAYS, assign_lanes, overlap_columns  # noqa: E402
+from .core import WEEKDAYS, Task, assign_lanes, overlap_columns, task_label  # noqa: E402
 from .dialogs import EventDialog  # noqa: E402
 
 
@@ -34,7 +34,8 @@ def round_rect(cr, x, y, w, h, r):
     cr.close_path()
 
 
-def text(cr, widget, s, x, y, width, size=9, bold=False, color=None, lines=1, align=Pango.Alignment.LEFT):
+def text(cr, widget, s, x, y, width, size=9, bold=False, color=None, lines=1, align=Pango.Alignment.LEFT,
+         strike=False):
     layout = widget.create_pango_layout(None)  # 위젯 글꼴·힌팅 설정을 그대로 쓴다
     fd = widget.get_pango_context().get_font_description().copy()
     fd.set_size(size * Pango.SCALE)
@@ -46,6 +47,10 @@ def text(cr, widget, s, x, y, width, size=9, bold=False, color=None, lines=1, al
     layout.set_height(-lines)
     layout.set_alignment(align)
     layout.set_text(s, -1)
+    if strike:
+        attrs = Pango.AttrList()
+        attrs.insert(Pango.attr_strikethrough_new(True))
+        layout.set_attributes(attrs)
     if color is not None:
         set_src(cr, color)
     cr.move_to(x, y)
@@ -123,7 +128,10 @@ class WeekView(Gtk.Box):
             f, l = e.days()
             if f <= we and l >= ws:
                 items.append((e, f, l))
-        items.sort(key=lambda x: (x[1], -(x[2] - x[1]).days, x[0].summary))
+        for t in getattr(self.win, "all_tasks", []):  # 그 주에 마감인 할 일도 하루짜리 막대로
+            if t.due is not None and ws <= t.due <= we:
+                items.append((t, t.due, t.due))
+        items.sort(key=lambda x: (x[1], isinstance(x[0], Task), -(x[2] - x[1]).days, x[0].summary))
         lanes = assign_lanes([(f, l) for _, f, l in items], ws)
         return [((e, cols), lane) for (e, _, _), (lane, cols) in zip(items, lanes)]
 
@@ -191,6 +199,15 @@ class WeekView(Gtk.Box):
             w = len(cols) * colw - 4
             y = self.HEAD + lane * self.LANE + 2
             c = rgba(self.win.store.colors.get(e.source_uid, "#62a0ea"))
+            if isinstance(e, Task):  # 할 일: 테두리만, 완료는 흐리게 + 줄
+                set_src(cr, c, 0.35 if e.done else 0.8)
+                cr.set_line_width(1)
+                round_rect(cr, x + 0.5, y + 0.5, w - 1, self.LANE - 5, 4)
+                cr.stroke()
+                text(cr, self, task_label(e), x + 6, y + 2, w - 9, size=8.5, bold=not e.done,
+                     color=rgba(fg.to_string(), 0.5 if e.done else 1), strike=e.done)
+                self._head_rects.append((x, y, w, self.LANE - 4, e))
+                continue
             set_src(cr, c, 0.28)
             round_rect(cr, x, y, w, self.LANE - 4, 4)
             cr.fill()
@@ -456,7 +473,10 @@ class WeekView(Gtk.Box):
     def _head_released(self, _g, _n, x, y):
         for rx, ry, rw, rh, e in self._head_rects:
             if rx <= x <= rx + rw and ry <= y <= ry + rh:
-                EventDialog(self.win, event=e).present(self.win)
+                if isinstance(e, Task):
+                    self.win.toggle_task(e, not e.done, label="완료를 취소했어요" if e.done else "완료했어요")
+                else:
+                    EventDialog(self.win, event=e).present(self.win)
                 return
         if x > self.GUTTER:
             i = min(int((x - self.GUTTER) // self._colw(self.head.get_width())), 6)

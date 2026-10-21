@@ -3,9 +3,9 @@ import unittest
 from datetime import date, datetime, timedelta
 
 from haruapp.core import (
-    WEEKDAY_CODES, Event, assign_lanes, build_rule, drag_range, fmt_day, ical_to_py, overlap_columns,
+    WEEKDAY_CODES, Event, Task, assign_lanes, build_rule, drag_range, fmt_day, ical_to_py, overlap_columns,
     parse_rule, py_to_ical, reminder_index, repeat_index, rule_start_problem, rule_until, set_reminder,
-    stretched_times,
+    stretched_times, task_label,
 )
 
 
@@ -105,6 +105,13 @@ class Rules(unittest.TestCase):
         rule = build_rule(1, date(2026, 10, 21), date(2026, 10, 31))
         self.assertEqual(parse_rule(rule)["UNTIL"], "20261031")
         self.assertEqual(rule_until(parse_rule(rule)), date(2026, 10, 31))
+
+
+class TaskLabel(unittest.TestCase):
+    def test_marks(self):
+        t = Task(uid="u", source_uid="s", summary="수학", due=date(2026, 10, 21), done=False, icomp=None)
+        self.assertEqual(task_label(t), "○ 수학")
+        self.assertEqual(task_label(Task(**{**t.__dict__, "done": True})), "✓ 수학")
 
 
 class Reminders(unittest.TestCase):
