@@ -7,10 +7,11 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("ECal", "2.0")
 gi.require_version("PangoCairo", "1.0")
-from gi.repository import Adw, ECal, Gdk, GLib, Gtk, Pango, PangoCairo  # noqa: E402
+from gi.repository import Adw, ECal, Gdk, GLib, GObject, Gtk, Pango, PangoCairo  # noqa: E402
 
 from .core import WEEKDAYS, Task, assign_lanes, overlap_columns, task_label  # noqa: E402
 from .dialogs import EventDialog  # noqa: E402
+from .widgets import TaskRef  # noqa: E402
 
 
 def rgba(hex_or_rgba, alpha=1.0):
@@ -96,8 +97,23 @@ class WeekView(Gtk.Box):
         motion.connect("motion", self._motion)
         self.body.add_controller(motion)
         head_click = Gtk.GestureClick()
+        head_click.connect("pressed", lambda _g, _n, x, y: setattr(self, "_head_press", (x, y)))
         head_click.connect("released", self._head_released)
         self.head.add_controller(head_click)
+        # 머리의 할 일 막대는 끌어서 다른 요일이나 오른쪽 할 일 목록으로 옮긴다
+        self._head_drag_task = None
+        head_src = Gtk.DragSource(actions=Gdk.DragAction.MOVE)
+        head_src.connect("prepare", self._head_drag_prepare)
+        head_src.connect("drag-begin", lambda src, drag: self.win._task_drag_begin(src, drag, self._head_drag_task))
+        head_src.connect("drag-end", lambda *_: self.win._task_drag_end())
+        self.head.add_controller(head_src)
+        # 오른쪽 할 일 목록에서 끌어 온 할 일 → 놓은 요일로 마감일 옮기기
+        self._drop_day = None
+        drop = Gtk.DropTarget.new(TaskRef.__gtype__, Gdk.DragAction.MOVE)
+        drop.connect("motion", self._drop_motion)
+        drop.connect("leave", lambda *_: self.set_drop_day(None))
+        drop.connect("drop", self._drop)
+        self.add_controller(drop)
         self.connect("map", lambda *_: GLib.idle_add(self._scroll_to_morning))
 
     # ── 데이터 ──
@@ -150,6 +166,40 @@ class WeekView(Gtk.Box):
             minutes = min(minutes, 24 * 60 - self.SNAP)
         return self.days()[i], minutes
 
+    def day_at(self, x, y):
+        """주 보기 좌표 → 그 칸의 날짜 (왼쪽 시각 칸이면 None).
+        본문은 스크롤 막대만큼 좁을 수 있어서 머리·본문 너비를 따로 쓴다."""
+        if x < self.GUTTER:
+            return None
+        width = self.head.get_width() if y < self.head.get_height() else self.body.get_width()
+        colw = self._colw(width)
+        return self.days()[min(max(int((x - self.GUTTER) // colw), 0), 6)]
+
+    def _head_drag_prepare(self, _src, x, y):
+        """할 일 막대 위에서 끌기 시작했을 때만 끌 내용을 만든다 (None 이면 끌기 안 함)."""
+        for rx, ry, rw, rh, e in self._head_rects:
+            if isinstance(e, Task) and rx <= x <= rx + rw and ry <= y <= ry + rh:
+                self._head_drag_task = e
+                self._head_drag_ref = TaskRef(e.source_uid, e.uid)  # 끄는 동안 살아 있게
+                return Gdk.ContentProvider.new_for_value(GObject.Value(TaskRef.__gtype__, self._head_drag_ref))
+        return None
+
+    def set_drop_day(self, day):
+        if day != self._drop_day:
+            self._drop_day = day
+            self.head.queue_draw()
+            self.body.queue_draw()
+
+    def _drop_motion(self, _target, x, y):
+        day = self.day_at(x, y)
+        self.set_drop_day(day)
+        return Gdk.DragAction.MOVE if day is not None else Gdk.DragAction(0)
+
+    def _drop(self, _target, ref, x, y):
+        day = self.day_at(x, y)
+        self.set_drop_day(None)
+        return self.win.drop_task(ref, day)
+
     def _dt(self, day, minutes):
         return datetime.combine(day, time()) + timedelta(minutes=minutes)
 
@@ -180,8 +230,8 @@ class WeekView(Gtk.Box):
         off_days = {d for e in getattr(self.win, "events", []) if e.day_off for d in self.days() if e.covers(d)}
         for i, d in enumerate(self.days()):
             x = self.GUTTER + i * colw
-            if d == self.win.selected:
-                set_src(cr, accent, 0.10)
+            if d == self.win.selected or d == self._drop_day:
+                set_src(cr, accent, 0.20 if d == self._drop_day else 0.10)
                 cr.rectangle(x, 0, colw, height)
                 cr.fill()
             color = red if (d.weekday() == 6 or d in off_days) else blue if d.weekday() == 5 else fg
@@ -224,8 +274,8 @@ class WeekView(Gtk.Box):
         today = date.today()
         # 오늘·선택한 날 배경
         for i, d in enumerate(days):
-            if d == self.win.selected:
-                set_src(cr, accent, 0.06)
+            if d == self.win.selected or d == self._drop_day:
+                set_src(cr, accent, 0.14 if d == self._drop_day else 0.06)
                 cr.rectangle(self.GUTTER + i * colw, 0, colw, height)
                 cr.fill()
         # 시간 줄
@@ -471,6 +521,9 @@ class WeekView(Gtk.Box):
             EventDialog(self.win, times=(s, s + timedelta(hours=1))).present(self.win)
 
     def _head_released(self, _g, _n, x, y):
+        px, py = getattr(self, "_head_press", (x, y))
+        if (x - px) ** 2 + (y - py) ** 2 > 64:
+            return  # 끌기가 시작되기 전(0.1초 안)에 휙 끌고 놓은 것 — 클릭으로 치지 않는다
         for rx, ry, rw, rh, e in self._head_rects:
             if rx <= x <= rx + rw and ry <= y <= ry + rh:
                 if isinstance(e, Task):

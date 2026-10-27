@@ -19,7 +19,7 @@ from .core import (  # noqa: E402
 )
 from .log import log  # noqa: E402
 from .store import Store  # noqa: E402
-from .widgets import DateButton  # noqa: E402
+from .widgets import DateButton, TaskRef  # noqa: E402
 from .dialogs import EventDialog, TaskDialog, NotionSetupDialog  # noqa: E402
 from .weekview import WeekView  # noqa: E402
 
@@ -124,6 +124,14 @@ class Window(Adw.ApplicationWindow):
         drag.connect("drag-update", self._drag_update)
         drag.connect("drag-end", self._drag_end)
         grid.add_controller(drag)
+        # 오른쪽 할 일 목록에서 끌어 온 할 일을 칸에 놓으면 그날로 마감일을 옮긴다
+        self._drop_cell = None
+        self._dragging = None  # 지금 끌고 있는 할 일 (아이콘·놓을 곳 표시용, 저장은 놓는 순간 다시 찾는다)
+        drop = Gtk.DropTarget.new(TaskRef.__gtype__, Gdk.DragAction.MOVE)
+        drop.connect("motion", self._task_drop_motion)
+        drop.connect("leave", lambda *_: self._mark_drop_cell(None))
+        drop.connect("drop", self._task_drop)
+        grid.add_controller(drop)
         for i, name in enumerate(["일", "월", "화", "수", "목", "금", "토"]):
             lab = Gtk.Label(label=name, margin_bottom=4)
             lab.add_css_class("caption-heading")
@@ -211,8 +219,17 @@ class Window(Adw.ApplicationWindow):
         self.notion_btn.add_css_class("suggested-action")
         self.notion_btn.connect("clicked", lambda *_: self.upload_diary())
 
-        for w in (self.day_title, self.day_list, add, self.day_tasks_title, self.day_task_entry,
-                  self.day_tasks, memo_title, memo_frame, self.notion_btn):
+        # 달력의 할 일 칩을 여기(할 일 묶음)에 놓으면 선택한 날로 옮긴다. 할 일이 없는 날도 놓을 수 있게 제목·입력칸까지
+        tasks_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        tasks_box.add_css_class("task-drop")
+        for w in (self.day_tasks_title, self.day_task_entry, self.day_tasks):
+            tasks_box.append(w)
+        drop = Gtk.DropTarget.new(TaskRef.__gtype__, Gdk.DragAction.MOVE)
+        drop.connect("enter", self._sidebar_drop_motion)
+        drop.connect("motion", self._sidebar_drop_motion)
+        drop.connect("drop", lambda _t, ref, _x, _y: self.drop_task(ref, self.selected))
+        tasks_box.add_controller(drop)
+        for w in (self.day_title, self.day_list, add, tasks_box, memo_title, memo_frame, self.notion_btn):
             side.append(w)
         scroller = Gtk.ScrolledWindow(child=side, hscrollbar_policy=Gtk.PolicyType.NEVER)
 
@@ -485,18 +502,17 @@ class Window(Adw.ApplicationWindow):
     def _drag_begin(self, _g, x, y):
         btn, event, chip = self._cell_at(x, y)
         self._drag = None
+        if chip is not None and event is None:
+            return  # 할 일 칩은 GTK 끌어 놓기(_task_drag_source)로 옮긴다 — 오른쪽 목록에도 놓을 수 있게
         if btn is not None and btn.cell["date"] is not None:
             mode = None
             grab = (0, 0)
             if chip is not None:
                 ok, p = self.grid.compute_point(chip, Graphene.Point().init(x, y))
-                if event is None:
-                    mode = "task"
-                else:
-                    mode = (self._chip_edge(chip, p.x) if ok else None) or "move"
+                mode = (self._chip_edge(chip, p.x) if ok else None) or "move"
                 grab = (p.x, p.y) if ok else (0, 0)
             self._drag = {"x": x, "y": y, "origin": btn.cell["date"], "target": btn.cell["date"],
-                          "event": event, "task": getattr(chip, "task", None), "mode": mode, "active": False,
+                          "event": event, "mode": mode, "active": False,
                           "grab": grab, "chip_w": btn.get_width() - 8}
 
     def _drag_update(self, g, dx, dy):
@@ -508,19 +524,16 @@ class Window(Adw.ApplicationWindow):
                 return
             d["active"] = True
             g.set_state(Gtk.EventSequenceState.CLAIMED)
-            if d["mode"] in ("move", "task"):
-                item = d["event"] or d["task"]
-                if d["task"] is not None:
-                    self.float_chip.set_label(task_label(item))
-                else:
-                    self.float_chip.set_label(item.summary if item.all_day else f"{item.start:%H:%M} {item.summary}")
+            if d["mode"] == "move":
+                item = d["event"]
+                self.float_chip.set_label(item.summary if item.all_day else f"{item.start:%H:%M} {item.summary}")
                 for cls in list(self.float_chip.get_css_classes()):
                     if cls.startswith("c") and cls[1:].isdigit():
                         self.float_chip.remove_css_class(cls)
                 self.float_chip.add_css_class(self._color_class.get(item.source_uid, "c0"))
                 self.float_chip.set_size_request(max(d["chip_w"], 60), -1)
                 self.float_chip.set_visible(True)
-        if d["mode"] in ("move", "task"):  # 막대가 칸에 맞춰지기 전에도 마우스를 부드럽게 따라온다
+        if d["mode"] == "move":  # 막대가 칸에 맞춰지기 전에도 마우스를 부드럽게 따라온다
             ok, p = self.grid.compute_point(self.month_overlay,
                                             Graphene.Point().init(d["x"] + dx - d["grab"][0], d["y"] + dy - d["grab"][1]))
             if ok:
@@ -530,10 +543,6 @@ class Window(Adw.ApplicationWindow):
         if btn is None or (d.get("shown") == btn.cell["date"]):
             return
         d["target"] = d["shown"] = btn.cell["date"]
-        if d["mode"] == "task":  # 할 일은 놓을 칸만 표시
-            for cell in self.cells:
-                (cell.add_css_class if cell.cell["date"] == d["target"] else cell.remove_css_class)("drag-range")
-            return
         a, b = self._drag_range(d)
         for cell in self.cells:
             on = a <= cell.cell["date"] <= b
@@ -555,14 +564,12 @@ class Window(Adw.ApplicationWindow):
 
     def _drag_end(self, _g, _dx, _dy):
         d, self._drag = self._drag, None
+        if d is None:
+            return  # 할 일 칩 끌기는 GTK 끌어 놓기가 칸 표시까지 정리한다
         self.float_chip.set_visible(False)
         for cell in self.cells:
             cell.remove_css_class("drag-range")
-        if d is None or not d["active"]:
-            return
-        if d["mode"] == "task":
-            if d["target"] != d["task"].due:
-                self.reschedule_task(d["task"], d["target"])
+        if not d["active"]:
             return
         a, b = self._drag_range(d)
         if d["event"] is None or (a, b) == d["event"].days():
@@ -576,6 +583,62 @@ class Window(Adw.ApplicationWindow):
         else:
             self.select_day(a)
             EventDialog(self, day=a, span=(a, b)).present(self)
+
+    # ── 드래그: 오른쪽 할 일 목록 → 달력 칸 (GTK 끌어 놓기라 목록 밖으로 끌고 나갈 수 있다) ──
+    def _task_drag_source(self, row, task):
+        ref = TaskRef(task.source_uid, task.uid)  # 끄는 동안 살아 있도록 여기서 잡아 둔다
+        src = Gtk.DragSource(actions=Gdk.DragAction.MOVE)
+        src.connect("prepare", lambda *_: Gdk.ContentProvider.new_for_value(GObject.Value(TaskRef.__gtype__, ref)))
+        src.connect("drag-begin", self._task_drag_begin, task)
+        src.connect("drag-end", self._task_drag_end)
+        row.add_controller(src)
+
+    def _task_drag_begin(self, _src, drag, task):
+        self._dragging = task
+        chip = Gtk.Label(label=task_label(task), xalign=0, ellipsize=Pango.EllipsizeMode.END)
+        chip.add_css_class("chip")
+        chip.add_css_class("floating")
+        chip.add_css_class(self._color_class.get(task.source_uid, "c0"))
+        chip.set_size_request(160, -1)
+        Gtk.DragIcon.get_for_drag(drag).set_child(chip)
+
+    def _task_drag_end(self, *_):
+        self._dragging = None
+        self._mark_drop_cell(None)
+        self.week.set_drop_day(None)
+
+    def _sidebar_drop_motion(self, _target, _x, _y):
+        # 이미 선택한 날의 할 일(오른쪽 목록에서 집은 것)이면 놓아도 그대로라 받지 않는다
+        t = self._dragging
+        return Gdk.DragAction(0) if t is not None and t.due == self.selected else Gdk.DragAction.MOVE
+
+    def _mark_drop_cell(self, day):
+        if day is not None and day == self._drop_cell:
+            return
+        self._drop_cell = day
+        for cell in self.cells:
+            (cell.add_css_class if day is not None and cell.cell["date"] == day else cell.remove_css_class)("drag-range")
+
+    def _task_drop_motion(self, _target, x, y):
+        btn, _, _ = self._cell_at(x, y)
+        day = btn.cell["date"] if btn is not None else None
+        self._mark_drop_cell(day)
+        return Gdk.DragAction.MOVE if day is not None else Gdk.DragAction(0)
+
+    def _task_drop(self, _target, ref, x, y):
+        btn, _, _ = self._cell_at(x, y)
+        self._mark_drop_cell(None)
+        return btn is not None and self.drop_task(ref, btn.cell["date"])
+
+    def drop_task(self, ref, day):
+        """끌어 온 할 일(TaskRef)을 day 로 옮긴다. 달력·주 보기의 놓기 대상이 같이 쓴다."""
+        # 끄는 동안 목록이 새로 그려졌을 수 있어서 놓는 순간의 할 일을 다시 찾는다
+        task = next((t for t in self.all_tasks if (t.source_uid, t.uid) == ref.key), None)
+        if task is None or day is None:
+            return False
+        if day != task.due:
+            self.reschedule_task(task, day)
+        return True
 
     def stretch(self, ev, first, last):
         """일정을 first~last 날짜에 걸치도록 바꾼다 (시각은 그대로)."""
@@ -655,6 +718,10 @@ class Window(Adw.ApplicationWindow):
     def _save_task(self, task, comp, fields, label=None):
         """할 일 변경을 바로 보여주고(구글 저장은 1초쯤 걸린다) 뒤에서 저장한다."""
         key, token = (task.source_uid, task.uid), object()
+        # 저장 중인 컴포넌트도 같이 둔다: 저장이 끝나기 전에 또 바꾸면(체크 후 바로 끌기 등) 이걸 바탕으로 고친다.
+        # 앞서 저장 중인 바뀐 필드도 이어받아야 체크 표시가 잠깐 풀려 보이지 않는다
+        prev = self._task_overrides.get(key, ({}, None))[0]
+        fields = {**prev, **fields, "icomp": comp.get_icalcomponent().clone()}
         self._task_overrides[key] = (fields, token)
         GLib.idle_add(lambda: self.refresh() and False)  # 체크박스 신호 처리 중에 목록을 지우지 않게
 
@@ -694,9 +761,11 @@ class Window(Adw.ApplicationWindow):
                 after()
         self.store.remove(task.source_uid, task.uid, None, ECal.ObjModType.ALL, done, label="삭제했어요")
 
-    def _task_row(self, task):
+    def _task_row(self, task, draggable=False):
         row = Adw.ActionRow(title=GLib.markup_escape_text(task.summary), activatable=True)
         row.task = task
+        if draggable:
+            self._task_drag_source(row, task)
         check = Gtk.CheckButton(active=task.done, valign=Gtk.Align.CENTER)
         check.add_css_class("selection-mode")
         check.connect("toggled", lambda b: self.toggle_task(task, b.get_active()))
@@ -857,13 +926,22 @@ class Window(Adw.ApplicationWindow):
         for cls in ("chip", "task", self._color_class.get(t.source_uid, "c0")) + (("done",) if t.done else ()):
             lab.add_css_class(cls)
         lab.task, lab.day = t, d
+        self._task_drag_source(lab, t)
         lab.set_cursor_from_name("pointer")
         lab.set_tooltip_text(f"{t.summary}\n누르면 {'완료 취소' if t.done else '완료'} · 끌어서 마감일 바꾸기")
         click = Gtk.GestureClick()
-        # 누르는 도중에 칸을 다시 그리면 안 되니 처리는 한 박자 뒤에
-        click.connect("released", lambda *_: GLib.idle_add(self._toggle_from_calendar, t))
+        click.connect("pressed", lambda _g, _n, x, y: setattr(lab, "press_at", (x, y)))
+        click.connect("released", lambda _g, _n, x, y: self._chip_released(lab, t, x, y))
         lab.add_controller(click)
         return lab
+
+    def _chip_released(self, lab, t, x, y):
+        # 끌기는 누른 지 0.1초가 지나야 시작돼서, 그 전에 휙 끌고 놓으면 클릭으로 들어온다 → 움직였으면 무시
+        px, py = getattr(lab, "press_at", (x, y))
+        if (x - px) ** 2 + (y - py) ** 2 > 64:
+            return
+        # 누르는 도중에 칸을 다시 그리면 안 되니 처리는 한 박자 뒤에
+        GLib.idle_add(self._toggle_from_calendar, t)
 
     def _toggle_from_calendar(self, t):
         self.toggle_task(t, not t.done, label="완료를 취소했어요" if t.done else "완료했어요")
@@ -908,7 +986,7 @@ class Window(Adw.ApplicationWindow):
         due = [t for t in getattr(self, "all_tasks", []) if t.due == d]
         self.day_tasks.set_visible(bool(due))
         for t in due:
-            self.day_tasks.append(self._task_row(t))
+            self.day_tasks.append(self._task_row(t, draggable=True))
         self._load_memo(d)
 
     # ── 메모 ──
@@ -1035,6 +1113,7 @@ BASE_CSS = """
 .month-cell .chip.task.done { opacity: .55; text-decoration-line: line-through; }
 .month-cell .day-num { margin-left: 4px; }
 .month-cell.drag-range { background-color: alpha(@accent_bg_color, .20); }
+.task-drop:drop(active) { background-color: alpha(@accent_bg_color, .12); border-radius: 12px; }
 .month-cell .chip.dragging { font-weight: 700; box-shadow: inset 0 2px alpha(@accent_bg_color, .95), inset 0 -2px alpha(@accent_bg_color, .95); }
 .month-cell.other-month { opacity: .45; }
 .month-cell.selected-day { background-color: alpha(@accent_bg_color, .14); box-shadow: inset 0 0 0 2px alpha(@accent_bg_color, .55); }

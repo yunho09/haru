@@ -5,9 +5,18 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, GLib, Gtk  # noqa: E402
+from gi.repository import Adw, GLib, GObject, Gtk  # noqa: E402
 
 from .core import fmt_day  # noqa: E402
+
+
+class TaskRef(GObject.Object):
+    """끌어 옮기는 할 일 표지. 문자열이 아닌 전용 타입이라 메모·입력칸이나 다른 앱은 받지 않는다."""
+    __gtype_name__ = "HaruTaskRef"
+
+    def __init__(self, source_uid, uid):
+        super().__init__()
+        self.key = (source_uid, uid)
 
 
 class DateButton(Gtk.MenuButton):
