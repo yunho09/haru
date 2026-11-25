@@ -89,6 +89,14 @@ def comp_dt(v):
     return ECal.ComponentDateTime.new(py_to_ical(v), None if not isinstance(v, datetime) else TZ_NAME)
 
 
+DAY_START_HOUR = 2  # 일기의 하루는 새벽 2시에 바뀐다 (자정 넘어 한 일도 그날 것)
+
+
+def diary_day(dt=None):
+    """일기 기준 날짜: 새벽 2시 전이면 전날."""
+    return ((dt or datetime.now()) - timedelta(hours=DAY_START_HOUR)).date()
+
+
 def as_date(v):
     return v.date() if isinstance(v, datetime) else v
 

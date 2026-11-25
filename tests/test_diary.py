@@ -299,17 +299,18 @@ class Commits(unittest.TestCase):
         p.start()
         self.addCleanup(p.stop)
         self.git("init", "-q")
-        for msg, when in (("어제 커밋", "2026-10-20T15:00:00"), ("오늘 커밋 1", "2026-10-21T10:00:00"),
-                          ("오늘 커밋 2", "2026-10-21T18:00:00")):
+        for msg, when in (("어제 커밋", "2026-10-20T15:00:00"), ("2시 전 커밋", "2026-10-21T01:59:00"),
+                          ("오늘 커밋 1", "2026-10-21T10:00:00"), ("오늘 커밋 2", "2026-10-21T18:00:00"),
+                          ("자정 넘긴 커밋", "2026-10-22T01:30:00"), ("내일 커밋", "2026-10-22T02:30:00")):
             (self.repo / "f").write_text(msg)
             self.git("add", "f")
             self.git("commit", "-q", "-m", msg, date_=when)
         (self.repo / "f").write_text("작업 중")  # stash 는 빼야 한다
-        self.git("stash", date_="2026-10-21T19:00:00")
+        self.git("stash", date_="2026-10-21T19:00:00")  # 하루 안
 
     def test_only_that_day_and_no_stash(self):
         got = diary.commits(date(2026, 10, 21), self.root)
-        self.assertEqual(got, [("proj", "오늘 커밋 1"), ("proj", "오늘 커밋 2")])
+        self.assertEqual(got, [("proj", "오늘 커밋 1"), ("proj", "오늘 커밋 2"), ("proj", "자정 넘긴 커밋")])
 
     def test_other_authors_are_skipped(self):
         (self.repo / "g").write_text("x")

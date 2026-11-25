@@ -4,6 +4,7 @@
     /usr/bin/python3 haru.py            앱 열기
     /usr/bin/python3 haru.py --diary    오늘 날짜 메모칸으로 열기
     /usr/bin/python3 haru.py --remind   (타이머용) 오늘 일기를 안 올렸으면 알림
+    /usr/bin/python3 haru.py --auto-upload   (타이머용) 메모가 있으면 그날 일기를 노션에 올림
 """
 import sys
 

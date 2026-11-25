@@ -26,7 +26,11 @@ GNOME용 가벼운 일정·할 일 관리 앱. GTK4 + libadwaita (Python).
 - **노션 일기에 올리기**: 그날의 할 일(체크 상태)·일정·git 커밋(`/data/project` 아래 레포)·메모를
   노션 🎒 일기 데이터베이스의 `2026-10-15` 페이지에 "📒 하루 기록" 상자로 올림. 다시 올리면 그 상자만
   바뀌고, 노션에서 직접 쓴 글은 그대로 둠
-- **밤 일기 알림**: 밤 10시에 그날 일기를 아직 안 올렸으면 알림, 누르면 오늘 메모칸으로 열림 (자동 업로드는 안 함)
+- **새벽 2시 자동 업로드**: 일기의 하루는 새벽 2시에 바뀜(자정 넘어 한 커밋·완료한 할 일도 전날 것).
+  새벽 2시에 막 끝난 하루의 메모를 적어 두었으면 위와 같은 내용을 노션 일기에 자동으로 올림
+  (이미 올린 날도 마지막 모습으로 다시 올림). 절전·꺼짐으로 놓치면 깨어난 뒤 그날 것을 올리고,
+  지난 일주일 중 메모는 있는데 못 올린 날도 같이 올림. 인터넷이 안 되면 몇 분간 다시 시도. 결과는 알림으로
+- **밤 일기 알림**: 밤 10시에 그날 일기를 안 올렸고 메모도 없으면 알림, 누르면 오늘 메모칸으로 열림
 - Ctrl+Z 되돌리기, 오류 로그 `~/.local/state/haru/haru.log`
 
 ## 실행
@@ -47,13 +51,14 @@ libadwaita 1.7 이상(GNOME 48+)이 필요하다 (월/주 전환 토글).
 
 | 파일 | 내용 |
 | --- | --- |
-| `haru.py` | 실행 파일 (`--diary`: 오늘 메모칸으로, `--remind`: 밤 일기 알림) |
+| `haru.py` | 실행 파일 (`--diary`: 오늘 메모칸으로, `--remind`: 밤 일기 알림, `--auto-upload`: 일기 자동 업로드) |
 | `haruapp/core.py` | 날짜·시간 변환, 일정·할 일 데이터, 반복 규칙, 드래그·겹침 계산 — GTK 없이 테스트 가능 |
 | `haruapp/store.py` | Evolution Data Server 연결·조회·쓰기·되돌리기, 연결 지연 감지·서비스 재시작 |
 | `haruapp/window.py` | 메인 창: 월 보기, 사이드바(일정·할 일·메모), 할 일 탭, 드래그, 되돌리기 |
 | `haruapp/weekview.py` | 주 보기 (cairo 로 직접 그리는 시간표) |
 | `haruapp/dialogs.py`, `widgets.py` | 일정·할 일·노션 연결 창, 날짜·시간 입력 |
 | `haruapp/diary.py` | 노션 일기 올리기, 메모·업로드 기록 파일 |
+| `haruapp/autoupload.py` | 새벽 2시 자동 업로드 (창 없이 캘린더에 붙어 모아 올림) |
 | `haruapp/app.py`, `log.py` | 앱 시작·명령줄·알림, 오류 로그 |
 
 ## 테스트
@@ -89,16 +94,26 @@ systemctl --user restart evolution-source-registry evolution-calendar-factory
 설정은 `~/.config/haru/notion.json` (권한 600)에 저장된다. 데이터베이스나 레포 위치를 바꾸려면
 이 파일의 `database_id`, `project_root` 를 고친다.
 
-## 밤 일기 알림
+## 밤 일기 알림 · 자동 업로드
 
 ```sh
-cp systemd/haru-diary-remind.* ~/.config/systemd/user/   # ExecStart 경로를 클론한 위치로
+cp systemd/haru-diary-*.* ~/.config/systemd/user/   # ExecStart 경로를 클론한 위치로
 systemctl --user daemon-reload
-systemctl --user enable --now haru-diary-remind.timer
+systemctl --user enable --now haru-diary-remind.timer haru-diary-upload.timer
 ```
 
-시각을 바꾸려면 `haru-diary-remind.timer` 의 `OnCalendar` 를 고친다. 그날 일기가 이미 있으면 알리지 않고,
-절전 중에 지나간 알림이 다음 날 아침에 뜨지 않게 21시 이후에만 알린다.
+시각을 바꾸려면 각 `.timer` 의 `OnCalendar` 를 고친다.
+
+- 알림(22:00): 그날 일기가 이미 있거나 메모를 적어 두었으면 알리지 않고, 절전 중에 지나간 알림이 다음 날
+  아침에 뜨지 않게 21시 이후에만 알린다.
+- 자동 업로드(02:00): 메모가 비어 있으면 올리지 않는다. 일기의 하루는 새벽 2시~다음 날 새벽 2시
+  (`core.DAY_START_HOUR`, 커밋 범위·할 일 완료 날짜·일기 쓰기 날짜가 이걸 따름)이고, 올릴 날은 "가장 최근에 끝난 하루"라
+  절전에서 아침에 깨어나 돌아도 놓친 그날 것을 올린다 (`DAY_START_HOUR` 를 바꾸면 타이머도 같이).
+  지난 7일 중 메모가 있는데 아직 안 올린 날(꺼져 있었거나 실패한 날)도 같이 올린다.
+  캘린더·할 일 목록이 다 연결되지 않으면(45초 넘게 안 붙으면 캘린더 서비스를 한 번 다시 띄움) 할 일이
+  빠진 채 덮어쓰지 않게 올리지 않고 알린다 — 공휴일·생일 캘린더는 상관없음.
+  지금 바로 돌려 보려면 `systemctl --user start haru-diary-upload.service` — 막 끝난 하루(새벽 2시 기준)를 올린다.
+  기록은 `~/.local/state/haru/haru.log`.
 
 ## 단축키
 

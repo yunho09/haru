@@ -17,6 +17,8 @@ import urllib.request
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+from .core import DAY_START_HOUR
+
 CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "haru" / "notion.json"
 UPLOADED = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "haru" / "uploaded"
 MEMO_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "haru" / "memo"
@@ -28,6 +30,10 @@ NOTION_VERSION = "2022-06-28"
 
 class NotionError(Exception):
     pass
+
+
+class Offline(NotionError):
+    """노션까지 닿지 못함 (인터넷 끊김·시간 초과) — 잠시 뒤 다시 하면 될 수 있다."""
 
 
 # ───────────────────────── 설정 · 메모 ─────────────────────────
@@ -92,13 +98,13 @@ def _uploaded_days():
 # ───────────────────────── 모으기 ─────────────────────────
 
 def commits(day, root):
-    """root 바로 아래 git 레포들에서 그날 내가 한 커밋 → [(레포, 제목)]"""
+    """root 바로 아래 git 레포들에서 그날(새벽 2시 ~ 다음 날 새벽 2시) 내가 한 커밋 → [(레포, 제목)]"""
     try:
         email = subprocess.run(["git", "config", "--global", "user.email"],
                                capture_output=True, text=True, timeout=5).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         email = ""
-    since = datetime.combine(day, datetime.min.time())
+    since = datetime.combine(day, datetime.min.time()) + timedelta(hours=DAY_START_HOUR)
     until = since + timedelta(days=1)
     out = []
     for repo in sorted(Path(root).iterdir()) if Path(root).is_dir() else []:
@@ -118,6 +124,20 @@ def commits(day, root):
                 seen.add(subject)
                 out.append((repo.name, subject))
     return out
+
+
+def day_items(day, tasks, events, skip_source):
+    """그날 올릴 할 일·일정 → ([(제목, 완료?)], [문자열]).
+    tasks·events 는 core.Task·Event, skip_source(캘린더 uid) 가 참이면 그 캘린더 일정은 뺀다 (공휴일·생일)."""
+    todos = [(t.summary, t.done) for t in tasks if t.due == day]
+    todos += [(t.summary, True) for t in tasks if t.done and t.completed == day and t.due != day]
+    lines = []
+    for e in events:
+        if not e.covers(day) or skip_source(e.source_uid):
+            continue
+        when = "하루 종일" if e.all_day else f"{e.start:%H:%M}–{e.end:%H:%M}"
+        lines.append(f"{when}  {e.summary}" + (f"  @{e.location}" if e.location else ""))
+    return todos, lines
 
 
 def build_entry(day, todos, events, commit_list, memo):
@@ -185,9 +205,9 @@ def _call(token, method, path, body=None, tries=4):
         with e:  # 오류 응답도 연결을 닫는다
             return _http_error(e, token, method, path, body, tries)
     except urllib.error.URLError as e:
-        raise NotionError(f"인터넷 연결을 확인해 주세요 ({e.reason})") from None
+        raise Offline(f"인터넷 연결을 확인해 주세요 ({e.reason})") from None
     except (OSError, http.client.HTTPException) as e:  # 읽다가 끊김·시간 초과
-        raise NotionError(f"노션과 통신하다 끊겼어요 ({e})") from None
+        raise Offline(f"노션과 통신하다 끊겼어요 ({e})") from None
     except ValueError:
         raise NotionError("노션 응답을 읽지 못했어요") from None
 

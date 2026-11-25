@@ -1,16 +1,16 @@
-"""앱 시작, 명령줄(--diary), 밤 일기 알림(--remind)."""
+"""앱 시작, 명령줄(--diary), 밤 일기 알림(--remind), 일기 자동 업로드(--auto-upload)."""
 import os
 import subprocess
 import sys
-from datetime import date, datetime
+from datetime import datetime
 
 import gi
 
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gio, GLib  # noqa: E402
 
-from . import diary  # noqa: E402
-from .core import APP_ID  # noqa: E402
+from . import autoupload, diary  # noqa: E402
+from .core import APP_ID, diary_day  # noqa: E402
 from .log import log, setup_log  # noqa: E402
 from .window import Window  # noqa: E402
 
@@ -43,11 +43,11 @@ class App(Adw.Application):
 
 
 def remind():
-    """밤 일기 알림 (systemd 타이머가 부른다). 이미 올렸으면 조용히 끝."""
-    today = date.today()
+    """밤 일기 알림 (systemd 타이머가 부른다). 이미 올렸거나 메모가 있으면(새벽 2시에 자동으로 올라감) 조용히 끝."""
+    today = diary_day()
     if datetime.now().hour < 21 and not os.environ.get("HARU_REMIND_NOW"):
         return 0  # 절전 중에 지나간 알림이 다음 날 아침에 뜨지 않게
-    if diary.is_uploaded(today):
+    if diary.is_uploaded(today) or diary.read_memo(today).strip():
         return 0
     try:
         if diary.find_page(diary.load_config(), today):  # 노션에서 직접 쓴 경우
@@ -56,7 +56,7 @@ def remind():
         log("일기 확인 실패:", e)
     res = subprocess.run(
         ["notify-send", "-a", "하루", "-i", "x-office-calendar", "-A", "default=열기", "-A", "open=일기 쓰기",
-         "오늘 일기 올릴까요?", "할 일 체크하고 메모 쓴 다음 '노션 일기에 올리기'를 눌러요"],
+         "오늘 일기 쓸까요?", "메모를 적어 두면 새벽 2시에 노션 일기로 자동으로 올라가요"],
         capture_output=True, text=True)
     if res.stdout.strip() in ("default", "open"):
         subprocess.Popen([sys.executable, os.path.abspath(sys.argv[0]), "--diary"], start_new_session=True,
@@ -68,4 +68,6 @@ def main():
     setup_log()
     if "--remind" in sys.argv[1:]:
         return remind()
+    if "--auto-upload" in sys.argv[1:]:
+        return autoupload.run()
     return App().run(sys.argv)

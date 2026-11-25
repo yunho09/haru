@@ -15,7 +15,7 @@ from gi.repository import Adw, ECal, Gdk, Gio, GLib, GObject, Graphene, Gtk, ICa
 
 from . import diary  # noqa: E402
 from .core import (  # noqa: E402
-    WEEKDAYS, Event, assign_lanes, comp_dt, drag_range, fmt_day, fmt_time, stretched_times, task_label,
+    WEEKDAYS, Event, assign_lanes, comp_dt, diary_day, drag_range, fmt_day, fmt_time, stretched_times, task_label,
 )
 from .log import log  # noqa: E402
 from .store import Store  # noqa: E402
@@ -751,7 +751,7 @@ class Window(Adw.ApplicationWindow):
             comp.set_percent_complete(0)
             comp.set_completed(None)
         comp.commit_sequence()
-        self._save_task(task, comp, {"done": done, "completed": date.today() if done else None}, label=label)
+        self._save_task(task, comp, {"done": done, "completed": diary_day() if done else None}, label=label)
 
     def delete_task(self, task, after=None):
         def done(err):
@@ -1026,9 +1026,9 @@ class Window(Adw.ApplicationWindow):
 
     # ── 노션 일기 ──
     def open_diary(self):
-        """오늘 날짜 메모칸으로 (밤 일기 알림을 눌렀을 때)."""
+        """오늘 일기 날짜 메모칸으로 (밤 일기 알림을 눌렀을 때). 새벽 2시 전이면 전날."""
         self.stack.set_visible_child_name("calendar")
-        self.select_day(date.today())
+        self.select_day(diary_day())
         if self.split.get_collapsed():
             self.split.set_show_sidebar(True)
         self.memo_view.grab_focus()
@@ -1041,14 +1041,8 @@ class Window(Adw.ApplicationWindow):
         self._flush_memo()
         d = self.selected
         # GI 객체는 메인 스레드에서만 다룬다: 할 일·일정은 여기서 문자열로 만들어 넘긴다
-        todos = [(t.summary, t.done) for t in self.all_tasks if t.due == d]
-        todos += [(t.summary, True) for t in self.all_tasks if t.done and t.completed == d and t.due != d]
-        events = []
-        for e in self.store.events(d, d + timedelta(days=1)):
-            if not e.covers(d) or self.store.is_holiday_source(e.source_uid) or e.source_uid == "birthdays":
-                continue
-            when = "하루 종일" if e.all_day else f"{e.start:%H:%M}–{e.end:%H:%M}"
-            events.append(f"{when}  {e.summary}" + (f"  @{e.location}" if e.location else ""))
+        todos, events = diary.day_items(d, self.all_tasks, self.store.events(d, d + timedelta(days=1)),
+                                        self.store.skip_in_diary)
         memo = diary.read_memo(d)
         self.notion_btn.set_sensitive(False)
 

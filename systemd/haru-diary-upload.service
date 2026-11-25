@@ -1,0 +1,8 @@
+[Unit]
+Description=하루: 메모가 있으면 오늘 일기를 노션에 자동 업로드
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /data/project/haru/haru.py --auto-upload
+# 오프라인이면 몇 분간 다시 시도한다. 그래도 멈춰 있으면 끝낸다
+TimeoutStartSec=20min

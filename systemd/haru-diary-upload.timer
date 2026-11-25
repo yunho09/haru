@@ -1,0 +1,12 @@
+[Unit]
+Description=하루: 새벽 2시 일기 자동 업로드 (전날 2시~오늘 2시 하루치)
+
+[Timer]
+OnCalendar=*-*-* 02:00:00
+# 기본 정확도(1분)로 늦게 돌아도 괜찮지만, 정각에 맞춘다
+AccuracySec=1s
+# 꺼져 있어서 놓쳤으면 켜진 뒤 바로 (절전은 깨어나면 알아서 돈다)
+Persistent=true
+
+[Install]
+WantedBy=timers.target

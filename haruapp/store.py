@@ -9,7 +9,7 @@ gi.require_version("ECal", "2.0")
 gi.require_version("ICalGLib", "3.0")
 from gi.repository import ECal, EDataServer, Gio, GLib, GObject, ICalGLib  # noqa: E402
 
-from .core import TZ, ical_to_py, as_date, text_of, Event, Task  # noqa: E402
+from .core import TZ, ical_to_py, as_date, diary_day, text_of, Event, Task  # noqa: E402
 from .log import log  # noqa: E402
 
 
@@ -30,6 +30,7 @@ class Store:
         self.on_slow = None  # (이름들) — 연결이 20초 넘게 안 될 때
         self.on_all_connected = None
         self._connecting = {}  # 연결 중인 source uid → 이름
+        self._failed = set()  # 연결에 실패한 source uid
         self._revive = None
         self._watch_registry()
         self.reconnect()
@@ -53,6 +54,8 @@ class Store:
         self.views = []
         self.clients = {}
         self.colors = {}
+        self._connecting = {}
+        self._failed = set()
         for ext, kind in (
             (EDataServer.SOURCE_EXTENSION_CALENDAR, ECal.ClientSourceType.EVENTS),
             (EDataServer.SOURCE_EXTENSION_TASK_LIST, ECal.ClientSourceType.TASKS),
@@ -71,6 +74,14 @@ class Store:
             self.on_slow(sorted(set(self._connecting.values())))
         return False
 
+    def pending(self):
+        """아직 연결 중인 캘린더·할 일 목록 이름들."""
+        return sorted(set(self._connecting.values()))
+
+    def not_connected(self):
+        """연결 중이거나 연결에 실패한 source uid 들."""
+        return sorted(set(self._connecting) | self._failed)
+
     def _done_connecting(self, gen, uid):
         if gen != self._gen:
             return
@@ -85,6 +96,8 @@ class Store:
             client = ECal.Client.connect_finish(res)
         except GLib.Error as e:
             log("연결 실패:", e.message)
+            if gen == self._gen:
+                self._failed.add(src_uid)
             return
         uid = client.get_source().get_uid()
         src = self.source(uid)
@@ -170,6 +183,10 @@ class Store:
     def is_holiday_source(self, uid):
         return "휴일" in self.name(uid) or "holiday" in self.name(uid).lower()
 
+    def skip_in_diary(self, uid):
+        """일기에 안 올리는 캘린더 (공휴일·생일)."""
+        return self.is_holiday_source(uid) or uid == "birthdays"
+
     def _clients(self, kind):
         return [
             (uid, c) for uid, c in list(self.clients.items())
@@ -250,7 +267,7 @@ class Store:
                     uid=comp.get_uid(), source_uid=uid,
                     summary=text_of(comp.get_summary()) or "(제목 없음)",
                     due=d, done=comp.get_status() == ICalGLib.PropertyStatus.COMPLETED,
-                    icomp=comp.get_icalcomponent(), completed=as_date(done_at) if done_at else None,
+                    icomp=comp.get_icalcomponent(), completed=diary_day(done_at) if isinstance(done_at, datetime) else done_at,
                 ))
         out.sort(key=lambda t: (t.due is None, t.due or date.max, t.summary))
         return out
